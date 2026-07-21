@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sunnysideup\EcommerceMCP;
+namespace Sunnysideup\EcommerceMCP\Exceptions;
 
 use RuntimeException;
 

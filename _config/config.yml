@@ -20,4 +20,4 @@ Sunnysideup\EcommerceMCP\Tools\CatalogueTools:
   # Freshness hints for the individual tools.
   category_ttl_ms: 3600000
   # Fully-qualified class name of your product DataObject.
-  product_class: 'Sunnysideup\Ecommerce\Pages'
+  product_class: 'Sunnysideup\Ecommerce\Pages\Product'
