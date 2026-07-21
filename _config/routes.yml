@@ -1,0 +1,8 @@
+---
+Name: mcpcatalogue-routes
+After:
+  - '#coreroutes'
+---
+SilverStripe\Control\Director:
+  rules:
+    'mcp': 'Sunnysideup\EcommerceMCP\Controllers\McpController'

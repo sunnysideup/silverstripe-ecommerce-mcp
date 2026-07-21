@@ -1,1 +1,23 @@
 # see https://docs.silverstripe.org/en/developer_guides/configuration/configuration/
+---
+Name: mcpcatalogue
+---
+Sunnysideup\EcommerceMCP\Controllers\McpController:
+  # Origin allow-list for DNS-rebinding protection. Requests carrying an Origin
+  # header not in this list are rejected with 403. Requests with no Origin
+  # header at all (normal server-to-server agent traffic) are permitted.
+  allowed_origins:
+    - 'https://claude.ai'
+    - 'https://chatgpt.com'
+  # Freshness hint (ms) advertised on tools/list. Your tool surface almost
+  # never changes, so make this generous.
+  tools_list_ttl_ms: 3600000
+
+Sunnysideup\EcommerceMCP\Tools\CatalogueTools:
+  # Hard ceiling on results returned by search_products, regardless of what
+  # the agent asks for. Do not raise this "just in case" — see README.
+  max_results: 20
+  # Freshness hints for the individual tools.
+  category_ttl_ms: 3600000
+  # Fully-qualified class name of your product DataObject.
+  product_class: 'Sunnysideup\Ecommerce\Pages'
