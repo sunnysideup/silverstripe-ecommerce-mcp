@@ -4,12 +4,18 @@ declare(strict_types=1);
 
 namespace Sunnysideup\EcommerceMCP\Tools;
 
-use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
-use Sunnysideup\EcommerceMCP\Interfaces\ToolProvider;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\ORM\DataList;
 use SilverStripe\ORM\DataObject;
+use Sunnysideup\Ecommerce\Api\ArrayMethods;
+use Sunnysideup\Ecommerce\Api\KeywordSearchBuilder;
+use Sunnysideup\Ecommerce\Model\Money\EcommerceCurrency;
+use Sunnysideup\Ecommerce\Pages\Product;
+use Sunnysideup\Ecommerce\Pages\ProductGroup;
+use Sunnysideup\Ecommerce\ProductsAndGroups\Applyers\ProductSearchFilter;
+use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
+use Sunnysideup\EcommerceMCP\Interfaces\ToolProvider;
 
 /**
  * The catalogue surface exposed to agents.
@@ -28,7 +34,23 @@ class CatalogueTools implements ToolProvider
 
     private static int $category_ttl_ms = 3600000;
 
-    private static string $product_class = 'App\Model\Product';
+    private static string $product_class = Product::class;
+    private static string $category_class = ProductGroup::class;
+
+    private static array $product_filter = [
+        'ShowInSearch' => 1,
+        'AllowPurchase' => 1,
+    ];
+
+    private static array $category_filter = [
+        'ShowInSearch' => 1,
+    ];
+
+    private static array $product_brand_methods = [
+        'getBrand',
+        'Brand',
+    ];
+
 
     public function definitions(): array
     {
@@ -141,17 +163,18 @@ class CatalogueTools implements ToolProvider
         $ceiling = (int) static::config()->get('max_results');
         $limit   = min((int) ($args['limit'] ?? 10), $ceiling);
 
-        // NOTE: PartialMatch is a LIKE '%...%' scan and will not survive a
-        // catalogue of any size. Swap this for your search index — see
-        // ProductSearchIndex in the README.
-        $list = $this->products()
-            ->filterAny([
-                'Title:PartialMatch'   => $query,
-                'Content:PartialMatch' => $query,
-            ]);
+        $list = $this->products();
 
+        $searchApi = KeywordSearchBuilder::create();
+
+        // do the same pre-processing ProductSearchFilter does:
+        $phrase = ProductSearchFilter::keyword_sanitised($query); // strip junk chars
+        $phrase = $searchApi->processKeyword($phrase);             // apply SearchReplacement synonyms
+
+        // '' = no extra WHERE clause, 20 = limit
+        $productIds = $searchApi->getProductResults($phrase, '', $limit);
         if (!empty($args['category'])) {
-            $list = $list->filter('Category.URLSegment', (string) $args['category']);
+            $list = $list->filter('ParentID', $this->findCategoryBySegment((string) $args['category']));
         }
         if (isset($args['min_price'])) {
             $list = $list->filter('Price:GreaterThanOrEqual', (float) $args['min_price']);
@@ -165,6 +188,11 @@ class CatalogueTools implements ToolProvider
 
         $matched = $list->count();
         $results = [];
+
+        $sorter = ArrayMethods::create_sort_statement_from_id_array($productIds, (string) static::config()->get('product_class'));
+        $list = $list->orderBy($sorter);
+
+
         foreach ($list->limit($limit) as $product) {
             $results[] = $this->summarise($product);
         }
@@ -183,11 +211,33 @@ class CatalogueTools implements ToolProvider
     private function getProduct(array $args): array
     {
         $product = $this->findBySku((string) ($args['sku'] ?? ''));
+        $productCategoryClass = (string) static::config()->get('category_class');
+        if (! $product) {
+            return [
+                'sku' => $args['sku'] ?? null,
+                'error' => sprintf('No product with SKU "%s"', $args['sku'] ?? ''),
+            ];
+        }
+        $parent = $product->Parent();
+        if (! $parent instanceof $productCategoryClass) {
+            $parent = null;
+        }
+        $brand = null;
+        foreach ($this->config()->get('product_brand_methods') as $fieldOrMethod => $value) {
+            if ($product->hasMethod($fieldOrMethod) && $product->$fieldOrMethod()) {
+                $brand = $product->$fieldOrMethod();
+                break;
+            }
+            if ($product->hasField($fieldOrMethod) && $product->$fieldOrMethod) {
+                $brand = $product->$fieldOrMethod;
+                break;
+            }
 
+        }
         return $this->summarise($product) + [
             'description'  => $this->plainText($product->Content ?? ''),
-            'brand'        => $product->Brand ?? null,
-            'category'     => $product->Category()->Title ?? null,
+            'brand'        => $brand ? $brand->Title : 'no brand',
+            'category'     => $parent?->Title ?? null,
             'specifications' => $this->specifications($product),
             'variants'     => $this->variants($product),
             'image'        => $product->hasMethod('Image') && $product->Image()->exists()
@@ -199,12 +249,18 @@ class CatalogueTools implements ToolProvider
     private function listCategories(): array
     {
         $categories = [];
-
-        foreach ($this->categoryClass()::get()->sort('Title') as $category) {
+        $categoriesClass = (string) static::config()->get('category_class');
+        $categoryFilter = (array) static::config()->get('category_filter');
+        if ($categoryFilter === []) {
+            $categoryFilter = ['ShowInSearch' => 1];
+        }
+        $list = $categoriesClass::get()->filter($categoryFilter)->sort('Title');
+        foreach ($list as $category) {
             $categories[] = [
                 'title'         => $category->Title,
+                'breadcrumb'    => $category->ProductGroupBreadcrumb ?? null,
                 'url_segment'   => $category->URLSegment,
-                'product_count' => $category->Products()->count(),
+                'product_count' => $category->Products()->filter(['ShowInSearch' => 1])->count(),
             ];
         }
 
@@ -215,13 +271,13 @@ class CatalogueTools implements ToolProvider
     {
         $skus = array_slice((array) ($args['skus'] ?? []), 0, 20);
         if ($skus === []) {
-            throw new JsonRpcException(-32602, 'skus must contain at least one SKU', 400);
+            throw new JsonRpcException(-32602, 'skus must contain at least one ID', 400);
         }
 
         $stock = [];
-        foreach ($this->products()->filter('SKU', $skus) as $product) {
-            $stock[$product->SKU] = [
-                'sku'         => $product->SKU,
+        foreach ($this->products()->filter('InternalItemID', $skus) as $product) {
+            $stock[$product->InternalItemID] = [
+                'sku'         => $product->InternalItemID,
                 'available'   => (int) $product->StockLevel,
                 'status'      => $this->stockStatus($product),
                 'price'       => $this->price($product),
@@ -240,11 +296,13 @@ class CatalogueTools implements ToolProvider
     private function summarise(DataObject $product): array
     {
         return [
-            'sku'    => $product->SKU,
-            'title'  => $product->Title,
-            'price'  => $this->price($product),
-            'status' => $this->stockStatus($product),
-            'url'    => $product->AbsoluteLink(),
+            'sku'        => $product->InternalItemID,
+            'title'      => $product->Title,
+            'type'       => $product->i18n_singular_name(),
+            'breadcrumb' => $product->ProductBreadcrumb ?? null,
+            'price'      => $this->price($product),
+            'status'     => $this->stockStatus($product),
+            'url'        => $product->AbsoluteLink(),
         ];
     }
 
@@ -252,7 +310,7 @@ class CatalogueTools implements ToolProvider
     {
         return [
             'amount'   => round((float) $product->Price, 2),
-            'currency' => 'NZD',
+            'currency' => EcommerceCurrency::default_currency_code(),
         ];
     }
 
@@ -284,7 +342,7 @@ class CatalogueTools implements ToolProvider
         $variants = [];
         foreach ($product->Variants() as $variant) {
             $variants[] = [
-                'sku'    => $variant->SKU,
+                'sku'    => $variant->InternalItemID,
                 'title'  => $variant->Title,
                 'price'  => $this->price($variant),
                 'status' => $this->stockStatus($variant),
@@ -311,13 +369,28 @@ class CatalogueTools implements ToolProvider
 
     private function findBySku(string $sku): DataObject
     {
-        $product = $this->products()->filter('SKU', $sku)->first();
+        if (!$sku) {
+            throw new JsonRpcException(-32602, 'sku must be non-empty', 400);
+        }
+        $product = $this->products()->filter('InternalItemID', $sku)->first();
 
         if (!$product) {
             throw new JsonRpcException(-32602, sprintf('No product with SKU "%s"', $sku), 400);
         }
 
         return $product;
+    }
+
+    private function findCategoryBySegment(string $segment): int
+    {
+        $class = (string) static::config()->get('category_class');
+        $category = $class::get()->filter('URLSegment', $segment)->first();
+
+        if (!$category) {
+            throw new JsonRpcException(-32602, sprintf('Unknown category "%s"', $segment), 400);
+        }
+
+        return (int) $category->ID;
     }
 
     /**
@@ -327,12 +400,11 @@ class CatalogueTools implements ToolProvider
     private function products(): DataList
     {
         $class = (string) static::config()->get('product_class');
-
-        return $class::get()->filter(['ShowInSearch' => 1]);
+        $filter = (array) static::config()->get('product_filter');
+        if ($filter === []) {
+            $filter = ['ShowInSearch' => 1, 'AllowPurchase' => 1];
+        }
+        return $class::get()->filter($filter);
     }
 
-    private function categoryClass(): string
-    {
-        return 'App\Model\ProductCategory';
-    }
 }
