@@ -171,8 +171,22 @@ class CatalogueTools implements ToolProvider
         $phrase = ProductSearchFilter::keyword_sanitised($query); // strip junk chars
         $phrase = $searchApi->processKeyword($phrase);             // apply SearchReplacement synonyms
 
-        // '' = no extra WHERE clause, 20 = limit
-        $productIds = $searchApi->getProductResults($phrase, '', $limit);
+        // '' = no extra WHERE clause, get more than we need so filters can reduce
+        $productIds = $searchApi->getProductResults($phrase, '', $ceiling * 5);
+
+        if (empty($productIds)) {
+            return [
+                'results'       => [],
+                'returned'      => 0,
+                'total_matched' => 0,
+                'truncated'     => false,
+                'hint'          => null,
+            ];
+        }
+
+        // Filter to only products returned by the search
+        $list = $list->filter('ID', $productIds);
+
         if (!empty($args['category'])) {
             $list = $list->filter('ParentID', $this->findCategoryBySegment((string) $args['category']));
         }
@@ -189,6 +203,7 @@ class CatalogueTools implements ToolProvider
         $matched = $list->count();
         $results = [];
 
+        // Sort by search relevance (order of IDs returned by search)
         $sorter = ArrayMethods::create_sort_statement_from_id_array($productIds, (string) static::config()->get('product_class'));
         $list = $list->orderBy($sorter);
 
@@ -223,7 +238,7 @@ class CatalogueTools implements ToolProvider
             $parent = null;
         }
         $brand = null;
-        foreach ($this->config()->get('product_brand_methods') as $fieldOrMethod => $value) {
+        foreach ($this->config()->get('product_brand_methods') as $fieldOrMethod) {
             if ($product->hasMethod($fieldOrMethod) && $product->$fieldOrMethod()) {
                 $brand = $product->$fieldOrMethod();
                 break;
@@ -260,7 +275,7 @@ class CatalogueTools implements ToolProvider
                 'title'         => $category->Title,
                 'breadcrumb'    => $category->ProductGroupBreadcrumb ?? null,
                 'url_segment'   => $category->URLSegment,
-                'product_count' => $category->Products()->filter(['ShowInSearch' => 1])->count(),
+                // 'product_count' => $category->Products()->filter(['ShowInSearch' => 1])->count(), do not do this - too slow.
             ];
         }
 
