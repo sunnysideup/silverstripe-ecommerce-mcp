@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Sunnysideup\EcommerceMCP\Controllers;
 
 use SilverStripe\Control\Controller;
-use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\Control\HTTPResponse;
 use SilverStripe\Core\Injector\Injector;
@@ -75,31 +74,25 @@ class McpController extends Controller
         if ($id === null) {
             return $this->plain(202, '');
         }
-        if (Director::isDev()) {
+
+        try {
             $this->assertProtocolVersion($request, $params);
             $this->assertHeadersMatchBody($request, $method, $params);
 
             $result = $this->dispatch($method, is_array($params) ? $params : []);
-        } else {
-            try {
-                $this->assertProtocolVersion($request, $params);
-                $this->assertHeadersMatchBody($request, $method, $params);
-
-                $result = $this->dispatch($method, is_array($params) ? $params : []);
-            } catch (JsonRpcException $e) {
-                return $this->error($id, $e->getCode(), $e->getMessage(), $e->getHttpStatus(), $e->getData());
-            } catch (Throwable $e) {
-                // Never leak stack traces to an agent.
-                user_error($e->getMessage(), E_USER_WARNING);
-                return $this->error($id, self::E_INTERNAL, 'Internal error', 500);
-            }
-
-            return $this->json(200, [
-                'jsonrpc' => '2.0',
-                'id'      => $id,
-                'result'  => $result,
-            ]);
+        } catch (JsonRpcException $e) {
+            return $this->error($id, $e->getCode(), $e->getMessage(), $e->getHttpStatus(), $e->getData());
+        } catch (Throwable $e) {
+            // Never leak stack traces to an agent.
+            user_error($e->getMessage(), E_USER_WARNING);
+            return $this->error($id, self::E_INTERNAL, 'Internal error', 500);
         }
+
+        return $this->json(200, [
+            'jsonrpc' => '2.0',
+            'id'      => $id,
+            'result'  => $result,
+        ]);
     }
 
     // ---------------------------------------------------------------- routing
