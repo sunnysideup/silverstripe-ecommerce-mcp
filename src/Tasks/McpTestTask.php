@@ -254,7 +254,7 @@ class McpTestTask extends BuildTask
 
         echo '<div class="response">';
         echo '<h3>Response</h3>';
-
+        $result = $registry->call($tool, $arguments);
         try {
             $result = $registry->call($tool, $arguments);
             echo '<pre class="success">' . htmlspecialchars(json_encode(

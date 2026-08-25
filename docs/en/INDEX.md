@@ -22,16 +22,6 @@ CatalogueTools      The four catalogue tools
 Drop `src/` and `_config/` into your `app/` directory, then
 `vendor/bin/sake dev/build flush=1`.
 
-## Adapt to your models
-
-`CatalogueTools` assumes a `Product` DataObject with `SKU`, `Title`,
-`Content`, `Price`, `StockLevel`, `ShowInSearch` and a `Category` relation,
-plus optional `Variants()` and `Specifications()` methods. Point
-`product_class` at your class in `_config/mcp.yml` and adjust the field names
-in `summarise()`, `price()` and `stockStatus()`. Everything else is
-model-agnostic.
-
-Hard-code your currency in `price()` — it is currently NZD.
 
 ## Search performance
 
@@ -133,3 +123,33 @@ for you:
 If you swap one in, `CatalogueTools` carries over unchanged — that is why
 the tools are isolated behind `ToolProvider`. Verify the current release on
 Packagist first; this ecosystem is moving weekly.
+
+## configuration
+
+Here is how to config the 
+
+```yml
+Sunnysideup\EcommerceMCP\Tools\CatalogueTools:
+  category_ttl_ms: 3600000 #how long before categories are stale
+
+  product_class: Sunnysideup\Ecommerce\Pages\Product
+  category_class: Sunnysideup\Ecommerce\Pages\ProductGroup
+  
+  product_stock_methods: 
+    - MyStockLevels
+
+  product_stock_sql_field: 'StockInt'
+  private static int $default_product_stock_methods_value: 10
+
+  product_brand_methods:
+    - 'getBrand'
+
+  product_brand_methods_sql_field: 'Brand.ID'
+  
+  default_product_brand_methods_value: 'No Brand'
+
+  product_category_methods: 
+    - MyCategoryName
+  product_category_methods_sql_field: 'ParentID'
+  default_product_category_methods_value: 'ParentID'
+```

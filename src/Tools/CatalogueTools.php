@@ -10,6 +10,7 @@ use SilverStripe\ORM\DataList;
 use SilverStripe\ORM\DataObject;
 use Sunnysideup\Ecommerce\Api\ArrayMethods;
 use Sunnysideup\Ecommerce\Api\KeywordSearchBuilder;
+use Sunnysideup\Ecommerce\Interfaces\BuyableModel;
 use Sunnysideup\Ecommerce\Model\Money\EcommerceCurrency;
 use Sunnysideup\Ecommerce\Pages\Product;
 use Sunnysideup\Ecommerce\Pages\ProductGroup;
@@ -32,10 +33,25 @@ class CatalogueTools implements ToolProvider
 
     private static int $max_results = 20;
 
+    /**
+     * how long before the categories should be rechecked?
+     */
     private static int $category_ttl_ms = 3600000;
 
     private static string $product_class = Product::class;
     private static string $category_class = ProductGroup::class;
+
+    private static array $product_stock_methods = [];
+    private static string $product_stock_sql_field = '';
+    private static int $default_product_stock_methods_value = 10;
+
+    private static array $product_brand_methods = [];
+    private static array $product_brand_methods_sql_field = '';
+    private static string $default_product_brand_methods_value = '';
+
+    private static array $product_category_methods = [];
+    private static string $product_category_methods_sql_field = '';
+    private static string $default_product_category_methods_value = '';
 
     private static array $product_filter = [
         'ShowInSearch' => 1,
@@ -44,11 +60,6 @@ class CatalogueTools implements ToolProvider
 
     private static array $category_filter = [
         'ShowInSearch' => 1,
-    ];
-
-    private static array $product_brand_methods = [
-        'getBrand',
-        'Brand',
     ];
 
 
@@ -78,7 +89,7 @@ class CatalogueTools implements ToolProvider
                         'max_price' => ['type' => 'number', 'minimum' => 0],
                         'in_stock_only' => [
                             'type'        => 'boolean',
-                            'description' => 'Exclude products with no available stock.',
+                            'description' => 'Show only products with stock available.',
                             'default'     => false,
                         ],
                         'limit' => [
@@ -96,8 +107,8 @@ class CatalogueTools implements ToolProvider
             [
                 'name'        => 'get_product',
                 'title'       => 'Get product detail',
-                'description' => 'Full detail for one product: description, specifications, '
-                    . 'variants, current price and stock.',
+                'description' => 'Full detail for one product: description'
+                    . 'current price and stock.',
                 'inputSchema' => [
                     'type'       => 'object',
                     'properties' => [
@@ -188,7 +199,10 @@ class CatalogueTools implements ToolProvider
         $list = $list->filter('ID', $productIds);
 
         if (!empty($args['category'])) {
-            $list = $list->filter('ParentID', $this->findCategoryBySegment((string) $args['category']));
+            $field = $this->config()->get('product_category_methods_sql_field');
+            if ($field) {
+                $list = $list->filter($field, $this->findCategoryBySegment((string) $args['category']));
+            }
         }
         if (isset($args['min_price'])) {
             $list = $list->filter('Price:GreaterThanOrEqual', (float) $args['min_price']);
@@ -196,15 +210,18 @@ class CatalogueTools implements ToolProvider
         if (isset($args['max_price'])) {
             $list = $list->filter('Price:LessThanOrEqual', (float) $args['max_price']);
         }
-        if (!empty($args['in_stock_only'])) {
-            $list = $list->filter('StockLevel:GreaterThan', 0);
+        if (isset($args['in_stock_only']) && $args['in_stock_only']) {
+            $field = $this->config()->get('product_stock_methods_sql_field');
+            if ($field) {
+                $list = $list->filter($field . ':GreaterThan', 0);
+            }
         }
 
         $matched = $list->count();
         $results = [];
 
         // Sort by search relevance (order of IDs returned by search)
-        $sorter = ArrayMethods::create_sort_statement_from_id_array($productIds, (string) static::config()->get('product_class'));
+        $sorter = ArrayMethods::create_sort_statement_from_id_array($list->columnUnique(), (string) static::config()->get('product_class'));
         $list = $list->orderBy($sorter);
 
 
@@ -226,35 +243,27 @@ class CatalogueTools implements ToolProvider
     private function getProduct(array $args): array
     {
         $product = $this->findBySku((string) ($args['sku'] ?? ''));
-        $productCategoryClass = (string) static::config()->get('category_class');
         if (! $product) {
             return [
                 'sku' => $args['sku'] ?? null,
                 'error' => sprintf('No product with SKU "%s"', $args['sku'] ?? ''),
             ];
         }
-        $parent = $product->Parent();
-        if (! $parent instanceof $productCategoryClass) {
-            $parent = null;
-        }
-        $brand = null;
-        foreach ($this->config()->get('product_brand_methods') as $fieldOrMethod) {
-            if ($product->hasMethod($fieldOrMethod) && $product->$fieldOrMethod()) {
-                $brand = $product->$fieldOrMethod();
-                break;
-            }
-            if ($product->hasField($fieldOrMethod) && $product->$fieldOrMethod) {
-                $brand = $product->$fieldOrMethod;
-                break;
-            }
 
-        }
+        $brand = $this->getValueFromMethodArray(
+            $product,
+            (array) static::config()->get('product_brand_methods'),
+            (string) static::config()->get('default_product_brand_methods_value')
+        );
+        $category = $this->getValueFromMethodArray(
+            $product,
+            (array) static::config()->get('product_category_methods'),
+            (string) static::config()->get('default_product_category_methods_value')
+        );
         return $this->summarise($product) + [
             'description'  => $this->plainText($product->Content ?? ''),
-            'brand'        => $brand ? $brand->Title : 'no brand',
-            'category'     => $parent?->Title ?? null,
-            'specifications' => $this->specifications($product),
-            'variants'     => $this->variants($product),
+            'brand'        => $brand,
+            'category'     => $category,
             'image'        => $product->hasMethod('Image') && $product->Image()->exists()
                 ? $product->Image()->getAbsoluteURL()
                 : null,
@@ -266,9 +275,6 @@ class CatalogueTools implements ToolProvider
         $categories = [];
         $categoriesClass = (string) static::config()->get('category_class');
         $categoryFilter = (array) static::config()->get('category_filter');
-        if ($categoryFilter === []) {
-            $categoryFilter = ['ShowInSearch' => 1];
-        }
         $list = $categoriesClass::get()->filter($categoryFilter)->sort('Title');
         foreach ($list as $category) {
             $categories[] = [
@@ -291,10 +297,12 @@ class CatalogueTools implements ToolProvider
 
         $stock = [];
         foreach ($this->products()->filter('InternalItemID', $skus) as $product) {
+            $value = $this->getStockForProduct($product);
+
             $stock[$product->InternalItemID] = [
                 'sku'         => $product->InternalItemID,
-                'available'   => (int) $product->StockLevel,
-                'status'      => $this->stockStatus($product),
+                'available'   => $value > 0,
+                'status'      => $this->stockStatus($value),
                 'price'       => $this->price($product),
             ];
         }
@@ -316,7 +324,7 @@ class CatalogueTools implements ToolProvider
             'type'       => $product->i18n_singular_name(),
             'breadcrumb' => $product->ProductBreadcrumb ?? null,
             'price'      => $this->price($product),
-            'status'     => $this->stockStatus($product),
+            'status'     => $this->stockStatus($this->getStockForProduct($product)),
             'url'        => $product->AbsoluteLink(),
         ];
     }
@@ -329,56 +337,12 @@ class CatalogueTools implements ToolProvider
         ];
     }
 
-    private function stockStatus(DataObject $product): string
+    private function stockStatus(int $availableStock): string
     {
-        return ((int) $product->StockLevel) > 0 ? 'in_stock' : 'out_of_stock';
+        return $availableStock > 0 ? 'in_stock' : 'out_of_stock';
     }
 
-    private function specifications(DataObject $product): array
-    {
-        if (!$product->hasMethod('Specifications')) {
-            return [];
-        }
 
-        $specs = [];
-        foreach ($product->Specifications() as $spec) {
-            $specs[$spec->Label] = $spec->Value;
-        }
-
-        return $specs;
-    }
-
-    private function variants(DataObject $product): array
-    {
-        if (!$product->hasMethod('Variants')) {
-            return [];
-        }
-
-        $variants = [];
-        foreach ($product->Variants() as $variant) {
-            $variants[] = [
-                'sku'    => $variant->InternalItemID,
-                'title'  => $variant->Title,
-                'price'  => $this->price($variant),
-                'status' => $this->stockStatus($variant),
-            ];
-        }
-
-        return $variants;
-    }
-
-    /**
-     * Agents pay for every token. Strip markup and cap length rather than
-     * shipping a 4,000-word CMS description.
-     */
-    private function plainText(string $html, int $maxChars = 1200): string
-    {
-        $text = trim(preg_replace('/\s+/', ' ', strip_tags($html)) ?? '');
-
-        return strlen($text) > $maxChars
-            ? rtrim(substr($text, 0, $maxChars)) . '…'
-            : $text;
-    }
 
     // ------------------------------------------------------------------ lookup
 
@@ -416,10 +380,57 @@ class CatalogueTools implements ToolProvider
     {
         $class = (string) static::config()->get('product_class');
         $filter = (array) static::config()->get('product_filter');
-        if ($filter === []) {
-            $filter = ['ShowInSearch' => 1, 'AllowPurchase' => 1];
-        }
         return $class::get()->filter($filter);
     }
+
+    protected function getCategoryForProduct(BuyableModel $product): int
+    {
+        $stockField = $this->getValueFromMethodArray(
+            $product,
+            (array) static::config()->get('product_category_methods'),
+            (string) static::config()->get('default_product_category_methods_value')
+        );
+        return (int) $stockField;
+    }
+
+    protected function getStockForProduct(BuyableModel $product): int
+    {
+        $stockField = $this->getValueFromMethodArray(
+            $product,
+            (array) static::config()->get('product_stock_methods'),
+            (string) static::config()->get('default_product_stock_methods_value')
+        );
+        return (int) $stockField;
+    }
+
+    protected function getValueFromMethodArray(BuyableModel $product, array $methods, mixed $default = null): mixed
+    {
+        /** @var BuyableModel&Product $product */
+        foreach ($methods as $fieldOrMethod) {
+            if ($product->hasMethod($fieldOrMethod) && $product->$fieldOrMethod()) {
+                return $product->$fieldOrMethod();
+            }
+            if ($product->hasField($fieldOrMethod) && $product->$fieldOrMethod) {
+                return $product->$fieldOrMethod;
+            }
+        }
+
+        return $default;
+    }
+
+
+    /**
+     * Agents pay for every token. Strip markup and cap length rather than
+     * shipping a 4,000-word CMS description.
+     */
+    private function plainText(string $html, int $maxChars = 1200): string
+    {
+        $text = trim(preg_replace('/\s+/', ' ', strip_tags($html)) ?? '');
+
+        return strlen($text) > $maxChars
+            ? rtrim(substr($text, 0, $maxChars)) . '…'
+            : $text;
+    }
+
 
 }
