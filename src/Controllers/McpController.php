@@ -41,7 +41,6 @@ use Throwable;
 class McpController extends Controller implements Flushable
 {
     /** Protocol revisions this server speaks. */
-    private const SUPPORTED_VERSIONS = ['2026-07-28'];
     private const DEFAULT_VERSION = '2025-11-25';
     private const META_NS = 'io.modelcontextprotocol/';
 
@@ -137,7 +136,6 @@ class McpController extends Controller implements Flushable
             'endpoint'                  => Director::absoluteURL($request->getURL()),
             'transport'                 => 'streamable-http',
             'methods'                   => ['POST'],
-            'supportedProtocolVersions' => self::SUPPORTED_VERSIONS,
         ];
 
         $response = $this->json(200, $payload);
@@ -179,9 +177,7 @@ class McpController extends Controller implements Flushable
         // Agree on a protocol version. Echo the client's if we speak it; otherwise
         // answer with ours and let the client decide whether to proceed.
         $clientVersion = (string) ($params['protocolVersion'] ?? '');
-        $version = in_array($clientVersion, self::SUPPORTED_VERSIONS, true)
-            ? $clientVersion
-            : self::SUPPORTED_VERSIONS[0];
+        $version = self::DEFAULT_VERSION;
 
         return [
             'protocolVersion' => $version,
@@ -330,7 +326,7 @@ class McpController extends Controller implements Flushable
     private function discover(): array
     {
         return [
-            'protocolVersion' => self::SUPPORTED_VERSIONS[0],
+            'protocolVersion' => self::DEFAULT_VERSION,
             'serverInfo'      => [
                 'name'    => 'catalogue',
                 'title'   => 'Product Catalogue',
@@ -399,7 +395,7 @@ class McpController extends Controller implements Flushable
             $status,
         );
         $response->addHeader('Content-Type', 'application/json');
-
+        $response->addHeader('Mcp-Session-Id', bin2hex(random_bytes(16)));
         return $response;
     }
 

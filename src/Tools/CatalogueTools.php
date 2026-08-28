@@ -272,8 +272,9 @@ class CatalogueTools implements ToolProvider
         $filter          = (array) $this->getCategoryFilter();
 
         // One query; iterate the array, not the DataList, to avoid re-querying.
-        $all = $categoriesClass::get()->filter($filter)->sort('Sort')->toArray();
-        $this->listCategoriesExtended($all);
+        $list = $categoriesClass::get()->filter($filter)->sort('Sort');
+        $list = $this->listCategoriesExtended($list);
+        $all = $list->toArray();
 
         $byParent = [];
         $ids      = [];
