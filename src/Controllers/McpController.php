@@ -9,6 +9,7 @@ use SilverStripe\Control\Controller;
 use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\Control\HTTPResponse;
+use SilverStripe\Core\Flushable;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\Versioned\Versioned;
 use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
@@ -37,11 +38,11 @@ use Throwable;
  *
  * Spec: https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
  */
-class McpController extends Controller
+class McpController extends Controller implements Flushable
 {
     /** Protocol revisions this server speaks. */
     private const SUPPORTED_VERSIONS = ['2026-07-28'];
-
+    private const DEFAULT_VERSION = '2025-11-25';
     private const META_NS = 'io.modelcontextprotocol/';
 
     /** JSON-RPC error codes. */
@@ -68,6 +69,7 @@ class McpController extends Controller
 
     public function index(HTTPRequest $request): HTTPResponse
     {
+
         // GET → public discovery manifest. Registries read this to learn the
         // endpoint and capabilities before ever issuing a JSON-RPC POST.
         if ($request->isGET()) {
@@ -105,8 +107,6 @@ class McpController extends Controller
         }
 
         try {
-            $this->assertProtocolVersion($request, $params);
-
             $result = $this->dispatch($method, is_array($params) ? $params : []);
         } catch (JsonRpcException $e) {
             return $this->error($id, $e->getCode(), $e->getMessage(), $e->getHttpStatus(), $e->getData());
@@ -153,6 +153,7 @@ class McpController extends Controller
         $registry = Injector::inst()->get(ToolRegistry::class);
 
         return match ($method) {
+            'initialize' => $this->initialize($params),
             'server/discover' => $this->discover(),
             'tools/list'      => [
                 'tools'      => $registry->definitions(),
@@ -173,7 +174,30 @@ class McpController extends Controller
             ),
         };
     }
+    private function initialize(array $params): array
+    {
+        // Agree on a protocol version. Echo the client's if we speak it; otherwise
+        // answer with ours and let the client decide whether to proceed.
+        $clientVersion = (string) ($params['protocolVersion'] ?? '');
+        $version = in_array($clientVersion, self::SUPPORTED_VERSIONS, true)
+            ? $clientVersion
+            : self::SUPPORTED_VERSIONS[0];
 
+        return [
+            'protocolVersion' => $version,
+            'serverInfo'      => [
+                'name'    => 'catalogue',
+                'title'   => 'Product Catalogue',
+                'version' => '1.0.0',
+            ],
+            'capabilities'    => [
+                'tools' => new \stdClass(),
+            ],
+            'instructions' => 'Search this catalogue with search_products before '
+                . 'answering questions about availability or price. Always cite the '
+                . 'returned url when recommending a product.',
+        ];
+    }
     /**
      * Execute a tool (via the result cache) and record the call. Logging runs
      * on every request — cache hit or miss — because the agent asked either way;
@@ -218,7 +242,7 @@ class McpController extends Controller
             return $registry->call($name, $arguments); // caching disabled
         }
 
-        $cache = $this->resultCache();
+        $cache = static::resultCache();
         $key   = $this->cacheKey($name, $arguments);
 
         try {
@@ -245,7 +269,7 @@ class McpController extends Controller
         return $result;
     }
 
-    private function resultCache(): CacheInterface
+    private static function resultCache(): CacheInterface
     {
         return Injector::inst()->get(CacheInterface::class . '.mcpResultCache');
     }
@@ -329,35 +353,35 @@ class McpController extends Controller
 
     // ------------------------------------------------------------- validation
 
-    /**
-     * The transport spec expects an MCP-Protocol-Version header, but a terse
-     * client that omits it isn't ambiguous when we speak exactly one version —
-     * so a missing header defaults rather than being rejected. What we still
-     * reject: a version we don't speak, or a header that contradicts _meta
-     * (which would mean a confused or tampering intermediary).
-     */
-    private function assertProtocolVersion(HTTPRequest $request, mixed $params): void
-    {
-        $header = $request->getHeader('MCP-Protocol-Version') ?? self::SUPPORTED_VERSIONS[0];
-        $meta   = is_array($params) ? ($params['_meta'][self::META_NS . 'protocolVersion'] ?? null) : null;
+    // /**
+    //  * The transport spec expects an MCP-Protocol-Version header, but a terse
+    //  * client that omits it isn't ambiguous when we speak exactly one version —
+    //  * so a missing header defaults rather than being rejected. What we still
+    //  * reject: a version we don't speak, or a header that contradicts _meta
+    //  * (which would mean a confused or tampering intermediary).
+    //  */
+    // private function assertProtocolVersion(HTTPRequest $request, mixed $params): void
+    // {
+    //     $header = $request->getHeader('MCP-Protocol-Version') ?? self::SUPPORTED_VERSIONS[0];
+    //     $meta   = is_array($params) ? ($params['_meta'][self::META_NS . 'protocolVersion'] ?? null) : null;
 
-        if ($meta !== null && $meta !== $header) {
-            throw new JsonRpcException(
-                self::E_VERSION_MISMATCH,
-                'MCP-Protocol-Version header does not match _meta',
-                400,
-            );
-        }
+    //     if ($meta !== null && $meta !== $header) {
+    //         throw new JsonRpcException(
+    //             self::E_VERSION_MISMATCH,
+    //             'MCP-Protocol-Version header does not match _meta',
+    //             400,
+    //         );
+    //     }
 
-        if (!in_array($header, self::SUPPORTED_VERSIONS, true)) {
-            throw new JsonRpcException(
-                self::E_INVALID_REQUEST,
-                sprintf('Unsupported protocol version "%s"', $header),
-                400,
-                ['supported' => self::SUPPORTED_VERSIONS],
-            );
-        }
-    }
+    //     if (!in_array($header, self::SUPPORTED_VERSIONS, true)) {
+    //         throw new JsonRpcException(
+    //             self::E_INVALID_REQUEST,
+    //             sprintf('Unsupported protocol version "%s"', $header),
+    //             400,
+    //             ['supported' => self::SUPPORTED_VERSIONS],
+    //         );
+    //     }
+    // }
 
     private function originAllowed(string $origin): bool
     {
@@ -397,5 +421,11 @@ class McpController extends Controller
     private function plain(int $status, string $body): HTTPResponse
     {
         return HTTPResponse::create($body, $status);
+    }
+
+    public static function flush()
+    {
+        // Implement flush logic here if needed
+        static::resultCache()->clear();
     }
 }
