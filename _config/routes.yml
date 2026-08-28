@@ -6,3 +6,18 @@ After:
 SilverStripe\Control\Director:
   rules:
     'mcp': 'Sunnysideup\EcommerceMCP\Controllers\McpController'
+---
+Name: mcpcatalogue-cache
+---
+SilverStripe\Core\Injector\Injector:
+  Psr\SimpleCache\CacheInterface.mcpRateLimiter:
+    factory: SilverStripe\Core\Cache\CacheFactory
+    constructor:
+      namespace: 'mcpRateLimiter'
+---
+Name: mcpcatalogue-controller
+---
+Sunnysideup\EcommerceMCP\Controllers\McpController:
+  rate_limit_max: 60
+  rate_limit_window_seconds: 60
+  # allowed_origins left empty = allow all (fine for public read-only catalogue)

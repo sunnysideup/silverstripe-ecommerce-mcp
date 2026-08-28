@@ -4,13 +4,15 @@ declare(strict_types=1);
 
 namespace Sunnysideup\EcommerceMCP\Tools;
 
+use Psr\Log\LoggerInterface;
 use SilverStripe\Core\Config\Configurable;
+use SilverStripe\Core\Convert;
 use SilverStripe\Core\Injector\Injectable;
+use SilverStripe\Core\Injector\Injector;
 use SilverStripe\ORM\DataList;
 use SilverStripe\ORM\DataObject;
 use Sunnysideup\Ecommerce\Api\ArrayMethods;
 use Sunnysideup\Ecommerce\Api\KeywordSearchBuilder;
-use Sunnysideup\Ecommerce\Interfaces\BuyableModel;
 use Sunnysideup\Ecommerce\Model\Money\EcommerceCurrency;
 use Sunnysideup\Ecommerce\Pages\Product;
 use Sunnysideup\Ecommerce\Pages\ProductGroup;
@@ -30,6 +32,19 @@ class CatalogueTools implements ToolProvider
 {
     use Injectable;
     use Configurable;
+    /**
+     * The parent's filter seam sees only category_ids. We stash the full search
+     * args here in searchProducts() so filterListByCategory() can read brand_ids
+     * and in_stock back out. Reset on every search; never read outside that flow.
+     */
+    protected array $searchArgs = [];
+
+    private static bool $is_enabled = true;
+
+    public function isEnabled(): bool
+    {
+        return $this->config()->get('is_enabled');
+    }
 
     private static int $max_results = 20;
 
@@ -41,18 +56,6 @@ class CatalogueTools implements ToolProvider
     private static string $product_class = Product::class;
     private static string $category_class = ProductGroup::class;
 
-    private static array $product_stock_methods = [];
-    private static string $product_stock_sql_field = '';
-    private static int $default_product_stock_methods_value = 10;
-
-    private static array $product_brand_methods = [];
-    private static array $product_brand_methods_sql_field = '';
-    private static string $default_product_brand_methods_value = '';
-
-    private static array $product_category_methods = [];
-    private static string $product_category_methods_sql_field = '';
-    private static string $default_product_category_methods_value = '';
-
     private static array $product_filter = [
         'ShowInSearch' => 1,
         'AllowPurchase' => 1,
@@ -62,36 +65,27 @@ class CatalogueTools implements ToolProvider
         'ShowInSearch' => 1,
     ];
 
-
     public function definitions(): array
     {
         return [
             [
                 'name'        => 'search_products',
                 'title'       => 'Search products',
-                'description' => 'Search the product catalogue by keyword, with optional '
-                    . 'category and price filters. Returns brief summaries. Call get_product '
-                    . 'for full detail on a specific SKU.',
+                'description' => 'Search the product catalogue. Use broad keywords first (e.g., "shoes" not "red nike running shoes"). If total_matched is high, use filters or add keywords. Always use this to find SKUs before calling get_product.',
                 'inputSchema' => [
                     'type'       => 'object',
                     'properties' => [
                         'query' => [
                             'type'        => 'string',
                             'description' => 'Keywords to match against product title and description.',
-                            'minLength'   => 2,
                         ],
-                        'category' => [
-                            'type'        => 'string',
-                            'description' => 'Restrict to a category. Use the url_segment '
-                                . 'returned by list_categories.',
+                        'category_ids' => [
+                            'type'        => 'array',
+                            'items'       => ['type' => 'integer'],
+                            'description' => 'Restrict to one or more category IDs returned by list_categories. Matches products in ANY of the provided categories.',
                         ],
                         'min_price' => ['type' => 'number', 'minimum' => 0],
                         'max_price' => ['type' => 'number', 'minimum' => 0],
-                        'in_stock_only' => [
-                            'type'        => 'boolean',
-                            'description' => 'Show only products with stock available.',
-                            'default'     => false,
-                        ],
                         'limit' => [
                             'type'        => 'integer',
                             'description' => 'Maximum results to return.',
@@ -99,16 +93,21 @@ class CatalogueTools implements ToolProvider
                             'maximum'     => 20,
                             'default'     => 10,
                         ],
+                        'offset' => [
+                            'type'        => 'integer',
+                            'description' => 'Pagination offset. Use to fetch the next page of results if total_matched > returned.',
+                            'minimum'     => 0,
+                            'default'     => 0,
+                        ],
                     ],
-                    'required'             => ['query'],
+                    'required'             => [],
                     'additionalProperties' => false,
                 ],
             ],
             [
                 'name'        => 'get_product',
                 'title'       => 'Get product detail',
-                'description' => 'Full detail for one product: description'
-                    . 'current price and stock.',
+                'description' => 'Retrieve deep details, exact stock availability, and variations for a specific product using its SKU.',
                 'inputSchema' => [
                     'type'       => 'object',
                     'properties' => [
@@ -121,30 +120,10 @@ class CatalogueTools implements ToolProvider
             [
                 'name'        => 'list_categories',
                 'title'       => 'List categories',
-                'description' => 'The category tree. Use this first to learn the vocabulary '
-                    . 'this catalogue uses before searching.',
+                'description' => 'The category tree. Use this first to learn the exact vocabulary and IDs this store uses before searching.',
                 'inputSchema' => [
                     'type'                 => 'object',
                     'properties'           => new \stdClass(),
-                    'additionalProperties' => false,
-                ],
-            ],
-            [
-                'name'        => 'check_stock',
-                'title'       => 'Check stock',
-                'description' => 'Live availability for up to 20 SKUs. Always call this before '
-                    . 'telling a customer something is in stock.',
-                'inputSchema' => [
-                    'type'       => 'object',
-                    'properties' => [
-                        'skus' => [
-                            'type'     => 'array',
-                            'items'    => ['type' => 'string'],
-                            'minItems' => 1,
-                            'maxItems' => 20,
-                        ],
-                    ],
-                    'required'             => ['skus'],
                     'additionalProperties' => false,
                 ],
             ],
@@ -153,170 +132,182 @@ class CatalogueTools implements ToolProvider
 
     public function execute(string $name, array $arguments): mixed
     {
+        $this->searchArgs = $arguments;
         return match ($name) {
-            'search_products' => $this->searchProducts($arguments),
-            'get_product'     => $this->getProduct($arguments),
+            'search_products' => $this->searchProducts(),
+            'get_product'     => $this->getProduct(),
             'list_categories' => $this->listCategories(),
-            'check_stock'     => $this->checkStock($arguments),
             default => throw new JsonRpcException(-32602, sprintf('Unknown tool "%s"', $name), 400),
         };
     }
 
     // ------------------------------------------------------------------ tools
-
-    private function searchProducts(array $args): array
+    protected function hasSearchConstraint(): bool
     {
-        $query = trim((string) ($args['query'] ?? ''));
-        if (strlen($query) < 2) {
-            throw new JsonRpcException(-32602, 'query must be at least 2 characters', 400);
-        }
+        return trim((string)($this->searchArgs['query'] ?? '')) !== ''
+            || !empty($this->searchArgs['category_ids'])
+            || isset($this->searchArgs['min_price'])
+            || isset($this->searchArgs['max_price']);
+    }
 
-        $ceiling = (int) static::config()->get('max_results');
-        $limit   = min((int) ($args['limit'] ?? 10), $ceiling);
-
-        $list = $this->products();
-
-        $searchApi = KeywordSearchBuilder::create();
-
-        // do the same pre-processing ProductSearchFilter does:
-        $phrase = ProductSearchFilter::keyword_sanitised($query); // strip junk chars
-        $phrase = $searchApi->processKeyword($phrase);             // apply SearchReplacement synonyms
-
-        // '' = no extra WHERE clause, get more than we need so filters can reduce
-        $productIds = $searchApi->getProductResults($phrase, '', $ceiling * 5);
-
-        if (empty($productIds)) {
+    protected function searchProducts(): array
+    {
+        if (! $this->hasSearchConstraint()) {
             return [
                 'results'       => [],
                 'returned'      => 0,
                 'total_matched' => 0,
                 'truncated'     => false,
-                'hint'          => null,
+                'hint'          => 'Provide at least one query parameter.',
             ];
         }
+        $query = Convert::raw2sql(trim((string) ($this->searchArgs['query'] ?? '')));
 
-        // Filter to only products returned by the search
-        $list = $list->filter('ID', $productIds);
+        if (strlen($query) < 2) {
+            $query = '';
+        }
 
-        if (!empty($args['category'])) {
-            $field = $this->config()->get('product_category_methods_sql_field');
-            if ($field) {
-                $list = $list->filter($field, $this->findCategoryBySegment((string) $args['category']));
+        $ceiling = (int) $this->config()->get('max_results');
+        $limit   = min((int) ($this->searchArgs['limit'] ?? 10), $ceiling);
+        $offset  = max(0, (int) ($this->searchArgs['offset'] ?? 0));
+
+        $list = $this->products();
+        $productIds = [];
+        if ($query) {
+            /** @var Injectable|KeywordSearchBuilder $searchApi */
+            $searchApi = KeywordSearchBuilder::create();
+
+            $phrase = ProductSearchFilter::keyword_sanitised($query);
+            $phrase = $searchApi->processKeyword($phrase);
+
+            $productIds = $searchApi->getProductResults($phrase, '', $ceiling * 10);
+
+            if (empty($productIds)) {
+                // Log zero-result searches to help build better search synonyms later
+                Injector::inst()->get(LoggerInterface::class)->info('MCP Zero Results Search: ' . $query);
+                return [
+                    'results'       => [],
+                    'returned'      => 0,
+                    'total_matched' => 0,
+                    'truncated'     => false,
+                    'hint'          => 'Try broader keywords or checking list_categories for correct terminology.',
+                ];
             }
-        }
-        if (isset($args['min_price'])) {
-            $list = $list->filter('Price:GreaterThanOrEqual', (float) $args['min_price']);
-        }
-        if (isset($args['max_price'])) {
-            $list = $list->filter('Price:LessThanOrEqual', (float) $args['max_price']);
-        }
-        if (isset($args['in_stock_only']) && $args['in_stock_only']) {
-            $field = $this->config()->get('product_stock_methods_sql_field');
-            if ($field) {
-                $list = $list->filter($field . ':GreaterThan', 0);
-            }
+            $list = $list->filter('ID', $productIds);
         }
 
+
+        // Apply filters
+        $list = $this->filterListByCategory($list);
+
+        if (isset($this->searchArgs['min_price'])) {
+            $list = $list->filter('Price:GreaterThanOrEqual', (float) $this->searchArgs['min_price']);
+        }
+        if (isset($this->searchArgs['max_price'])) {
+            $list = $list->filter('Price:LessThanOrEqual', (float) $this->searchArgs['max_price']);
+        }
+
+        // other searches?
+        $list = $this->searchProductsExtended($list);
+
+        // count results!
         $matched = $list->count();
-        $results = [];
 
-        // Sort by search relevance (order of IDs returned by search)
-        $sorter = ArrayMethods::create_sort_statement_from_id_array($list->columnUnique(), (string) static::config()->get('product_class'));
+        // figure out sort
+        if ($productIds !== []) {
+            $productIds = array_values(array_intersect($productIds, $list->columnUnique()));
+        } else {
+            $productIds = $list->columnUnique();
+        }
+        $sorter = ArrayMethods::create_sort_statement_from_id_array($productIds, $this->getProductClass());
         $list = $list->orderBy($sorter);
+        $list = $this->searchProductsExtendedSort($list);
 
-
-        foreach ($list->limit($limit) as $product) {
+        // Apply pagination (limit and offset)
+        $results = [];
+        foreach ($list->limit($limit, $offset) as $product) {
             $results[] = $this->summarise($product);
         }
+
+        $totalReturned = $offset + count($results);
 
         return [
             'results'       => $results,
             'returned'      => count($results),
+            'offset'        => $offset,
             'total_matched' => $matched,
-            'truncated'     => $matched > count($results),
-            'hint'          => $matched > count($results)
-                ? 'More matches exist. Narrow the query or add filters rather than raising limit.'
+            'truncated'     => $matched > $totalReturned,
+            'hint'          => $matched > $totalReturned
+                ? sprintf('Displaying %d-%d of %d. Pass offset=%d to see the next page.', $offset + 1, $totalReturned, $matched, $totalReturned)
                 : null,
         ];
     }
 
-    private function getProduct(array $args): array
+    protected function getProduct(): array
     {
-        $product = $this->findBySku((string) ($args['sku'] ?? ''));
+        $sku = (string) ($this->searchArgs['sku'] ?? '');
+        $product = $this->findBySku($sku);
+
         if (! $product) {
             return [
-                'sku' => $args['sku'] ?? null,
-                'error' => sprintf('No product with SKU "%s"', $args['sku'] ?? ''),
+                'sku'   => $sku,
+                'error' => sprintf('No product found with SKU "%s".', $sku),
             ];
         }
 
-        $brand = $this->getValueFromMethodArray(
-            $product,
-            (array) static::config()->get('product_brand_methods'),
-            (string) static::config()->get('default_product_brand_methods_value')
-        );
-        $category = $this->getValueFromMethodArray(
-            $product,
-            (array) static::config()->get('product_category_methods'),
-            (string) static::config()->get('default_product_category_methods_value')
-        );
         return $this->summarise($product) + [
             'description'  => $this->plainText($product->Content ?? ''),
-            'brand'        => $brand,
-            'category'     => $category,
+            'category'     => $product->Parent()->exists() ? $product->Parent()->Title : null,
             'image'        => $product->hasMethod('Image') && $product->Image()->exists()
                 ? $product->Image()->getAbsoluteURL()
                 : null,
+            // Expose basic availability status
+            'can_purchase' => $product->hasMethod('canPurchase') ? $product->canPurchase() : true,
         ];
     }
 
-    private function listCategories(): array
+    protected function listCategories(): array
     {
-        $categories = [];
-        $categoriesClass = (string) static::config()->get('category_class');
-        $categoryFilter = (array) static::config()->get('category_filter');
-        $list = $categoriesClass::get()->filter($categoryFilter)->sort('Title');
-        foreach ($list as $category) {
-            $categories[] = [
-                'title'         => $category->Title,
-                'breadcrumb'    => $category->ProductGroupBreadcrumb ?? null,
-                'url_segment'   => $category->URLSegment,
-                // 'product_count' => $category->Products()->filter(['ShowInSearch' => 1])->count(), do not do this - too slow.
-            ];
+        $categoriesClass = (string) $this->getCategoryClass();
+        $filter          = (array) $this->getCategoryFilter();
+
+        // One query; iterate the array, not the DataList, to avoid re-querying.
+        $all = $categoriesClass::get()->filter($filter)->sort('Sort')->toArray();
+        $this->listCategoriesExtended($all);
+
+        $byParent = [];
+        $ids      = [];
+        foreach ($all as $cat) {
+            $byParent[(int) $cat->ParentID][] = $cat;
+            $ids[(int) $cat->ID] = true;
         }
 
-        return ['categories' => $categories, 'ttlMs' => static::config()->get('category_ttl_ms')];
-    }
+        $build = function (array $nodes) use (&$build, $byParent): array {
+            $out = [];
+            foreach ($nodes as $cat) {
+                $entry = ['id' => (int) $cat->ID, 'title' => $cat->Title];
+                $children = $byParent[(int) $cat->ID] ?? [];
+                if ($children !== []) {
+                    $entry['children'] = $build($children);
+                }
+                $out[] = $entry;
+            }
+            return $out;
+        };
 
-    private function checkStock(array $args): array
-    {
-        $skus = array_slice((array) ($args['skus'] ?? []), 0, 20);
-        if ($skus === []) {
-            throw new JsonRpcException(-32602, 'skus must contain at least one ID', 400);
-        }
+        // A node is a root when its parent isn't itself a visible category here —
+        // handles the shop-root ProductGroup being shown or hidden, either way.
+        $roots = array_filter($all, static fn ($cat): bool => !isset($ids[(int) $cat->ParentID]));
 
-        $stock = [];
-        foreach ($this->products()->filter('InternalItemID', $skus) as $product) {
-            $value = $this->getStockForProduct($product);
-
-            $stock[$product->InternalItemID] = [
-                'sku'         => $product->InternalItemID,
-                'available'   => $value > 0,
-                'status'      => $this->stockStatus($value),
-                'price'       => $this->price($product),
-            ];
-        }
-
-        // Report SKUs we could not resolve rather than silently dropping them —
-        // an agent that gets four results for five SKUs will otherwise guess.
-        $unknown = array_values(array_diff($skus, array_keys($stock)));
-
-        return ['stock' => array_values($stock), 'unknown_skus' => $unknown];
+        return [
+            'categories' => $build(array_values($roots)),
+            'ttlMs'      => $this->config()->get('category_ttl_ms'),
+        ];
     }
 
     // ----------------------------------------------------------------- shaping
 
-    private function summarise(DataObject $product): array
+    protected function summarise(DataObject $product): array
     {
         return [
             'sku'        => $product->InternalItemID,
@@ -324,12 +315,11 @@ class CatalogueTools implements ToolProvider
             'type'       => $product->i18n_singular_name(),
             'breadcrumb' => $product->ProductBreadcrumb ?? null,
             'price'      => $this->price($product),
-            'status'     => $this->stockStatus($this->getStockForProduct($product)),
             'url'        => $product->AbsoluteLink(),
         ];
     }
 
-    private function price(DataObject $product): array
+    protected function price(DataObject $product): array
     {
         return [
             'amount'   => round((float) $product->Price, 2),
@@ -337,100 +327,112 @@ class CatalogueTools implements ToolProvider
         ];
     }
 
-    private function stockStatus(int $availableStock): string
-    {
-        return $availableStock > 0 ? 'in_stock' : 'out_of_stock';
-    }
-
-
-
     // ------------------------------------------------------------------ lookup
 
-    private function findBySku(string $sku): DataObject
+    /**
+     * Finds a product by its SKU.
+     */
+    protected function findBySku(string $sku): ?DataObject
     {
         if (!$sku) {
-            throw new JsonRpcException(-32602, 'sku must be non-empty', 400);
-        }
-        $product = $this->products()->filter('InternalItemID', $sku)->first();
-
-        if (!$product) {
-            throw new JsonRpcException(-32602, sprintf('No product with SKU "%s"', $sku), 400);
+            return null;
         }
 
-        return $product;
+        return Product::get()->filter('InternalItemID', Convert::raw2sql($sku))->first();
     }
 
-    private function findCategoryBySegment(string $segment): int
+    protected function products(): DataList
     {
-        $class = (string) static::config()->get('category_class');
-        $category = $class::get()->filter('URLSegment', $segment)->first();
-
-        if (!$category) {
-            throw new JsonRpcException(-32602, sprintf('Unknown category "%s"', $segment), 400);
-        }
-
-        return (int) $category->ID;
-    }
-
-    /**
-     * Base list. Everything an agent can see must be publicly visible —
-     * this is the single choke point for that guarantee.
-     */
-    private function products(): DataList
-    {
-        $class = (string) static::config()->get('product_class');
-        $filter = (array) static::config()->get('product_filter');
+        $class = (string) $this->getProductClass();
+        $filter = (array) $this->getProductFilter();
         return $class::get()->filter($filter);
     }
 
-    protected function getCategoryForProduct(BuyableModel $product): int
-    {
-        $stockField = $this->getValueFromMethodArray(
-            $product,
-            (array) static::config()->get('product_category_methods'),
-            (string) static::config()->get('default_product_category_methods_value')
-        );
-        return (int) $stockField;
-    }
-
-    protected function getStockForProduct(BuyableModel $product): int
-    {
-        $stockField = $this->getValueFromMethodArray(
-            $product,
-            (array) static::config()->get('product_stock_methods'),
-            (string) static::config()->get('default_product_stock_methods_value')
-        );
-        return (int) $stockField;
-    }
-
-    protected function getValueFromMethodArray(BuyableModel $product, array $methods, mixed $default = null): mixed
-    {
-        /** @var BuyableModel&Product $product */
-        foreach ($methods as $fieldOrMethod) {
-            if ($product->hasMethod($fieldOrMethod) && $product->$fieldOrMethod()) {
-                return $product->$fieldOrMethod();
-            }
-            if ($product->hasField($fieldOrMethod) && $product->$fieldOrMethod) {
-                return $product->$fieldOrMethod;
-            }
-        }
-
-        return $default;
-    }
-
-
     /**
-     * Agents pay for every token. Strip markup and cap length rather than
-     * shipping a 4,000-word CMS description.
+     * Converts CMS HTML into agent-friendly pseudo-markdown.
+     * Preserves list structure and paragraph breaks before stripping tags.
      */
-    private function plainText(string $html, int $maxChars = 1200): string
+    protected function plainText(string $html, int $maxChars = 1200): string
     {
-        $text = trim(preg_replace('/\s+/', ' ', strip_tags($html)) ?? '');
+        // Convert common block elements to text-based equivalents
+        $html = preg_replace('/<br\s*\/?>/i', "\n", $html ?? '');
+        $html = preg_replace('/<\/p>/i', "\n\n", $html);
+        $html = preg_replace('/<li[^>]*>/i', "\n* ", $html);
+
+        // Strip the rest of the HTML tags
+        $text = trim(strip_tags($html));
+
+        // Collapse excess whitespace
+        $text = preg_replace('/\n{3,}/', "\n\n", $text);
 
         return strlen($text) > $maxChars
             ? rtrim(substr($text, 0, $maxChars)) . '…'
             : $text;
     }
+
+    /**
+     * Filters a DataList of products by category IDs.
+     */
+    protected function filterListByCategory(DataList $list): DataList
+    {
+        $categoryIds = (array) ($this->searchArgs['category_ids'] ?? []);
+        $categoryIds = array_values(array_unique(array_map('intval', $categoryIds)));
+        if (empty($categoryIds)) {
+            return $list;
+        }
+
+        $categoriesClass = (string) $this->config()->get('category_class');
+        $allowedProductIds = [];
+
+        foreach ($categoryIds as $categoryId) {
+            $category = $categoriesClass::get()->byID((int) $categoryId);
+            if ($category) {
+                $products = $category->getProducts();
+                if ($products && $products->exists()) {
+                    $allowedProductIds = array_merge($allowedProductIds, $products->column('ID'));
+                }
+            }
+        }
+
+        return $list->filter('ID', array_unique($allowedProductIds));
+    }
+
+    protected function searchProductsExtended(DataList $list): DataList
+    {
+        // Implement any additional filtering logic here.
+        return $list;
+    }
+
+    protected function searchProductsExtendedSort(DataList $list): DataList
+    {
+        // Implement any additional sorting logic here.
+        return $list;
+    }
+    protected function listCategoriesExtended(DataList $list): DataList
+    {
+        // Implement any additional listing logic here.
+        return $list;
+    }
+
+    protected function getProductClass(): string
+    {
+        return (string) $this->config()->get('product_class');
+    }
+
+    protected function getProductFilter(): array
+    {
+        return (array) $this->config()->get('product_filter');
+    }
+
+    protected function getCategoryClass(): string
+    {
+        return (string) $this->config()->get('category_class');
+    }
+    protected function getCategoryFilter(): array
+    {
+        return (array) $this->config()->get('category_filter');
+    }
+
 
 
 }

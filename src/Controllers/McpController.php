@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace Sunnysideup\EcommerceMCP\Controllers;
 
+use Psr\SimpleCache\CacheInterface;
 use SilverStripe\Control\Controller;
+use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\Control\HTTPResponse;
 use SilverStripe\Core\Injector\Injector;
+use SilverStripe\Versioned\Versioned;
 use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
+use Sunnysideup\EcommerceMCP\Model\McpRequestLog;
 use Sunnysideup\EcommerceMCP\Registry\ToolRegistry;
 use Throwable;
 
@@ -19,6 +23,13 @@ use Throwable;
  * Deliberately has no session, no handshake and no persistent state: every
  * POST is self-contained, which maps cleanly onto PHP-FPM's process-per-request
  * model. Any instance behind a round-robin load balancer can serve any request.
+ *
+ * Two verbs are served at this one endpoint:
+ *   - POST: the JSON-RPC transport (tools/list, tools/call, server/discover).
+ *   - GET:  a public, cacheable discovery manifest that registries and crawlers
+ *           can read cold, without the protocol-version/header handshake a POST
+ *           requires. (This revision removed the GET SSE stream, so GET is free
+ *           to carry the manifest.)
  *
  * Spec: https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
  */
@@ -36,6 +47,7 @@ class McpController extends Controller
     private const E_INVALID_PARAMS  = -32602;
     private const E_INTERNAL        = -32603;
     private const E_HEADER_MISMATCH = -32020;
+    private const E_RATE_LIMITED    = -32029;
 
     private static array $allowed_actions = ['index'];
 
@@ -43,12 +55,32 @@ class McpController extends Controller
 
     private static int $tools_list_ttl_ms = 3600000;
 
+    /**
+     * Per-IP request cap per window. 0 (or less) disables rate limiting.
+     * These are deliberately coarse; a CDN/web-server limit in front is still
+     * the first line of defence for a publicly-listed endpoint.
+     */
+    private static int $rate_limit_max = 60;
+
+    private static int $rate_limit_window_seconds = 60;
+
     public function index(HTTPRequest $request): HTTPResponse
     {
+        // GET → public discovery manifest. Registries read this to learn the
+        // endpoint and capabilities before ever issuing a JSON-RPC POST.
+        if ($request->isGET()) {
+            return $this->manifest($request);
+        }
+
         // The GET stream endpoint and the DELETE session teardown were both
         // removed in this revision. Older clients may still try them.
         if (!$request->isPOST()) {
             return $this->plain(405, 'Method Not Allowed');
+        }
+
+        // Throttle before touching origin checks, JSON parsing or the DB.
+        if (($retryAfter = $this->rateLimitRetryAfter($request)) !== null) {
+            return $this->tooManyRequests($retryAfter);
         }
 
         if (($origin = $request->getHeader('Origin')) && !$this->originAllowed($origin)) {
@@ -95,6 +127,88 @@ class McpController extends Controller
         ]);
     }
 
+    // ---------------------------------------------------------------- discovery
+
+    /**
+     * Public discovery manifest served over GET. Reuses the same payload as the
+     * JSON-RPC server/discover method and adds the transport details a cold
+     * reader needs (where to POST, which verbs and protocol versions). Marked
+     * cacheable so CDNs and crawlers don't re-fetch it on every visit.
+     */
+    private function manifest(HTTPRequest $request): HTTPResponse
+    {
+        $payload = $this->discover() + [
+            'endpoint'                  => Director::absoluteURL($request->getURL()),
+            'transport'                 => 'streamable-http',
+            'methods'                   => ['POST'],
+            'supportedProtocolVersions' => self::SUPPORTED_VERSIONS,
+        ];
+
+        $response = $this->json(200, $payload);
+        $response->addHeader('Cache-Control', 'public, max-age=3600');
+
+        return $response;
+    }
+
+    // ------------------------------------------------------------ rate limiting
+
+    /**
+     * Fixed-window per-IP limiter. Returns the number of seconds until the
+     * window resets when the cap is exceeded, or null when the request is
+     * allowed (or limiting is disabled / the IP is unknown).
+     *
+     * The get-then-set is not atomic, so under heavy concurrency the effective
+     * cap can drift slightly above the configured value. That is fine for a
+     * coarse abuse guard; if you need a hard cap, enforce it at the CDN/LB.
+     */
+    private function rateLimitRetryAfter(HTTPRequest $request): ?int
+    {
+        $max = (int) static::config()->get('rate_limit_max');
+        if ($max <= 0) {
+            return null; // disabled
+        }
+
+        $ip = (string) $request->getIP();
+        if ($ip === '') {
+            return null; // can't identify the caller — don't block everyone
+        }
+
+        $window = max(1, (int) static::config()->get('rate_limit_window_seconds'));
+        $bucket = (int) floor(time() / $window);
+        $key    = 'mcp_rl_' . sha1($ip) . '_' . $bucket;
+
+        $cache = $this->rateLimitCache();
+        $count = (int) $cache->get($key, 0);
+
+        if ($count >= $max) {
+            $resetsIn = (($bucket + 1) * $window) - time();
+
+            return $resetsIn > 0 ? $resetsIn : 1;
+        }
+
+        // TTL just past the window so the bucket key self-expires.
+        $cache->set($key, $count + 1, $window + 1);
+
+        return null;
+    }
+
+    private function rateLimitCache(): CacheInterface
+    {
+        return Injector::inst()->get(CacheInterface::class . '.mcpRateLimiter');
+    }
+
+    private function tooManyRequests(int $retryAfter): HTTPResponse
+    {
+        $response = $this->json(429, [
+            'jsonrpc' => '2.0',
+            'id'      => null,
+            'error'   => ['code' => self::E_RATE_LIMITED, 'message' => 'Rate limit exceeded'],
+        ]);
+        $response->addHeader('Retry-After', (string) $retryAfter);
+
+        return $response;
+    }
+
     // ---------------------------------------------------------------- routing
 
     private function dispatch(string $method, array $params): array
@@ -110,7 +224,8 @@ class McpController extends Controller
                 'ttlMs'      => static::config()->get('tools_list_ttl_ms'),
                 'cacheScope' => 'public',
             ],
-            'tools/call' => $registry->call(
+            'tools/call' => $this->callTool(
+                $registry,
                 (string) ($params['name'] ?? ''),
                 (array) ($params['arguments'] ?? []),
             ),
@@ -121,7 +236,51 @@ class McpController extends Controller
             ),
         };
     }
+    /**
+     * Execute a tool and record the call. The log write is wrapped so a DB
+     * failure degrades to a warning rather than turning a good tool response
+     * into a 500 — an audit trail must never be load-bearing for the response.
+     */
+    private function callTool(ToolRegistry $registry, string $name, array $arguments): array
+    {
+        Versioned::set_stage(Versioned::LIVE);
+        $result = $registry->call($name, $arguments);
 
+        try {
+            McpRequestLog::track(
+                (string) json_encode($arguments, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                $this->countResults($result),
+                $name,
+            );
+        } catch (Throwable $e) {
+            user_error('MCP log write failed: ' . $e->getMessage(), E_USER_WARNING);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Best-effort "number of results provided" across the tool surface: a
+     * results/categories list is counted; an error payload is zero; a single
+     * object (e.g. get_product) is one.
+     */
+    private function countResults(mixed $result): int
+    {
+        if (!is_array($result)) {
+            return 0;
+        }
+        // The registry wraps tool output; look at the structured payload.
+        $payload = $result['structuredContent'] ?? $result;
+        if (!is_array($payload)) {
+            return 0;
+        }
+        foreach (['results', 'categories', 'brands'] as $key) {
+            if (isset($payload[$key]) && is_array($payload[$key])) {
+                return count($payload[$key]);
+            }
+        }
+        return isset($payload['error']) ? 0 : 1;
+    }
     /**
      * Capability discovery. Replaces the initialize/initialized handshake,
      * which no longer exists. Clients call this on demand rather than up front.

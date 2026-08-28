@@ -126,7 +126,7 @@ Packagist first; this ecosystem is moving weekly.
 
 ## configuration
 
-Here is how to config the 
+Here is how to config the `CatalogueTools` class.
 
 ```yml
 Sunnysideup\EcommerceMCP\Tools\CatalogueTools:
@@ -135,21 +135,5 @@ Sunnysideup\EcommerceMCP\Tools\CatalogueTools:
   product_class: Sunnysideup\Ecommerce\Pages\Product
   category_class: Sunnysideup\Ecommerce\Pages\ProductGroup
   
-  product_stock_methods: 
-    - MyStockLevels
 
-  product_stock_sql_field: 'StockInt'
-  private static int $default_product_stock_methods_value: 10
-
-  product_brand_methods:
-    - 'getBrand'
-
-  product_brand_methods_sql_field: 'Brand.ID'
-  
-  default_product_brand_methods_value: 'No Brand'
-
-  product_category_methods: 
-    - MyCategoryName
-  product_category_methods_sql_field: 'ParentID'
-  default_product_category_methods_value: 'ParentID'
 ```

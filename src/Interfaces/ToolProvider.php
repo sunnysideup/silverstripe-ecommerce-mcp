@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace Sunnysideup\EcommerceMCP\Interfaces;
 
-/**
- * Anything that exposes one or more MCP tools.
- */
 use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
 
 interface ToolProvider
@@ -25,4 +22,6 @@ interface ToolProvider
      * @throws JsonRpcException on invalid arguments
      */
     public function execute(string $name, array $arguments): mixed;
+
+    public function isEnabled(): bool;
 }

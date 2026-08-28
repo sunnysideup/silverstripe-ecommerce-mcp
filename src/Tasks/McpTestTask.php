@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Sunnysideup\EcommerceMCP\Tasks;
 
 use SilverStripe\Control\Director;
+use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\Dev\BuildTask;
 use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
@@ -13,8 +14,12 @@ use Sunnysideup\EcommerceMCP\Registry\ToolRegistry;
 /**
  * Interactive test form for shop owners to test MCP catalogue tools.
  *
- * Run via browser:
- *   /dev/tasks/mcp-test
+ * Run via browser:  /dev/tasks/mcp-test
+ * Run via CLI:      sake dev/tasks/mcp-test   (runs smoke tests)
+ *
+ * Extension seams: definitions(), callTool() and smokeTests() are the three
+ * points a subclass overrides to drive a specific ToolProvider instead of the
+ * globally-registered ToolRegistry — see McpTestTaskPW.
  */
 class McpTestTask extends BuildTask
 {
@@ -26,25 +31,22 @@ class McpTestTask extends BuildTask
 
     public function run($request): void
     {
-        $registry = Injector::inst()->get(ToolRegistry::class);
-        $definitions = $registry->definitions();
+        $definitions = $this->definitions();
 
-        // Get submitted values
-        $tool = $request->getVar('tool') ?? '';
+        $tool      = (string) ($request->getVar('tool') ?? '');
         $submitted = $request->getVar('submit') !== null;
 
         if (Director::is_cli()) {
-            $this->runCliMode($registry, $definitions);
+            $this->runCliMode($definitions);
             return;
         }
 
-        // HTML form
         echo $this->renderStyles();
         echo '<div class="mcp-test">';
         echo '<h1>MCP Catalogue Tools Test</h1>';
         echo '<p>Select a tool and fill in the parameters to test the MCP endpoint.</p>';
 
-        // Tool selector form
+        // Tool selector
         echo '<form method="get" class="tool-selector">';
         echo '<label for="tool"><strong>Select Tool:</strong></label> ';
         echo '<select name="tool" id="tool" onchange="this.form.submit()">';
@@ -61,21 +63,20 @@ class McpTestTask extends BuildTask
         echo '</select>';
         echo '</form>';
 
-        // If a tool is selected, show its parameter form
-        if ($tool) {
+        // Selected tool's parameter form
+        if ($tool !== '') {
             $toolDef = $this->findToolDefinition($definitions, $tool);
             if ($toolDef) {
                 echo $this->renderToolForm($toolDef, $request);
 
-                // If form was submitted, execute the tool
                 if ($submitted) {
                     $arguments = $this->extractArguments($toolDef, $request);
-                    $this->executeAndRender($registry, $tool, $arguments);
+                    $this->executeAndRender($tool, $arguments);
                 }
             }
         }
 
-        // Show available tools summary
+        // Available tools summary
         echo '<div class="tools-summary">';
         echo '<h2>Available Tools</h2>';
         foreach ($definitions as $def) {
@@ -89,6 +90,65 @@ class McpTestTask extends BuildTask
 
         echo '</div>';
     }
+
+    // -------------------------------------------------- extension seams
+
+    /**
+     * The tool definitions to render. Override to test a specific provider.
+     */
+    protected function definitions(): array
+    {
+        return $this->registry()->definitions();
+    }
+
+    /**
+     * Execute a tool and return its own payload (envelope unwrapped). Override
+     * to route calls at a specific provider rather than the shared registry.
+     * May throw JsonRpcException; callers handle it.
+     */
+    protected function callTool(string $tool, array $arguments): array
+    {
+        $result = $this->registry()->call($tool, $arguments);
+
+        // The registry wraps tool output in an MCP envelope; the renderer wants
+        // the tool's own structured payload.
+        return is_array($result)
+            ? ($result['structuredContent'] ?? $result)
+            : ['result' => $result];
+    }
+
+    /**
+     * CLI smoke tests, as [label, tool, args, summary] rows. Subclasses
+     * array_merge their own onto these.
+     */
+    protected function smokeTests(): array
+    {
+        return [
+            [
+                'label'   => 'list_categories',
+                'tool'    => 'list_categories',
+                'args'    => [],
+                'summary' => fn (array $r): string => sprintf('Found %d categories', count($r['categories'] ?? [])),
+            ],
+            [
+                'label'   => "search_products (query: 'test')",
+                'tool'    => 'search_products',
+                'args'    => ['query' => 'test', 'limit' => 3],
+                'summary' => fn (array $r): string => sprintf(
+                    'Returned: %d, Total: %d',
+                    $r['returned'] ?? 0,
+                    $r['total_matched'] ?? 0
+                ),
+            ],
+        ];
+    }
+
+    private function registry(): ToolRegistry
+    {
+        return Injector::inst()->get(ToolRegistry::class);
+    }
+
+    // -------------------------------------------------- form helpers
 
     private function findToolDefinition(array $definitions, string $name): ?array
     {
@@ -109,9 +169,9 @@ class McpTestTask extends BuildTask
         $html .= '<form method="get">';
         $html .= sprintf('<input type="hidden" name="tool" value="%s">', htmlspecialchars($toolDef['name']));
 
-        $schema = $toolDef['inputSchema'] ?? [];
+        $schema     = $toolDef['inputSchema'] ?? [];
         $properties = $schema['properties'] ?? [];
-        $required = $schema['required'] ?? [];
+        $required   = $schema['required'] ?? [];
 
         if (empty($properties) || $properties instanceof \stdClass) {
             $html .= '<p><em>This tool has no parameters.</em></p>';
@@ -119,9 +179,9 @@ class McpTestTask extends BuildTask
             $html .= '<table class="params">';
             foreach ($properties as $name => $prop) {
                 $isRequired = in_array($name, $required, true);
-                $type = $prop['type'] ?? 'string';
-                $value = $request->getVar($name) ?? ($prop['default'] ?? '');
-                $desc = $prop['description'] ?? '';
+                $type       = $prop['type'] ?? 'string';
+                $value      = $request->getVar($name) ?? ($prop['default'] ?? '');
+                $desc       = $prop['description'] ?? '';
 
                 $html .= '<tr>';
                 $html .= sprintf(
@@ -162,26 +222,31 @@ class McpTestTask extends BuildTask
 
             case 'integer':
             case 'number':
-                $min = isset($prop['minimum']) ? ' min="' . (int)$prop['minimum'] . '"' : '';
-                $max = isset($prop['maximum']) ? ' max="' . (int)$prop['maximum'] . '"' : '';
+                $min = isset($prop['minimum']) ? ' min="' . (int) $prop['minimum'] . '"' : '';
+                $max = isset($prop['maximum']) ? ' max="' . (int) $prop['maximum'] . '"' : '';
                 return sprintf(
                     '<input type="number" name="%s" id="%s" value="%s"%s%s step="%s">',
                     $htmlName,
                     $htmlName,
-                    htmlspecialchars((string)$value),
+                    htmlspecialchars((string) $value),
                     $min,
                     $max,
                     $type === 'integer' ? '1' : 'any'
                 );
 
             case 'array':
-                // For arrays, use textarea with one item per line
+                // One item per line; extractArguments() splits and casts.
+                $itemType   = $prop['items']['type'] ?? 'string';
+                $placeholder = $itemType === 'integer' || $itemType === 'number'
+                    ? 'One number per line'
+                    : 'One item per line';
                 $textValue = is_array($value) ? implode("\n", $value) : $value;
                 return sprintf(
-                    '<textarea name="%s" id="%s" rows="3" placeholder="One item per line">%s</textarea>',
+                    '<textarea name="%s" id="%s" rows="3" placeholder="%s">%s</textarea>',
                     $htmlName,
                     $htmlName,
-                    htmlspecialchars((string)$textValue)
+                    $placeholder,
+                    htmlspecialchars((string) $textValue)
                 );
 
             default: // string
@@ -190,17 +255,17 @@ class McpTestTask extends BuildTask
                     '<input type="text" name="%s" id="%s" value="%s"%s>',
                     $htmlName,
                     $htmlName,
-                    htmlspecialchars((string)$value),
-                    $minLen ? ' minlength="' . (int)$minLen . '"' : ''
+                    htmlspecialchars((string) $value),
+                    $minLen ? ' minlength="' . (int) $minLen . '"' : ''
                 );
         }
     }
 
     private function extractArguments(array $toolDef, $request): array
     {
-        $schema = $toolDef['inputSchema'] ?? [];
+        $schema     = $toolDef['inputSchema'] ?? [];
         $properties = $schema['properties'] ?? [];
-        $arguments = [];
+        $arguments  = [];
 
         if (empty($properties) || $properties instanceof \stdClass) {
             return [];
@@ -208,7 +273,7 @@ class McpTestTask extends BuildTask
 
         foreach ($properties as $name => $prop) {
             $value = $request->getVar($name);
-            $type = $prop['type'] ?? 'string';
+            $type  = $prop['type'] ?? 'string';
 
             if ($value === null || $value === '') {
                 continue;
@@ -216,70 +281,113 @@ class McpTestTask extends BuildTask
 
             switch ($type) {
                 case 'boolean':
-                    $arguments[$name] = (bool)$value;
+                    $arguments[$name] = (bool) $value;
                     break;
                 case 'integer':
-                    $arguments[$name] = (int)$value;
+                    $arguments[$name] = (int) $value;
                     break;
                 case 'number':
-                    $arguments[$name] = (float)$value;
+                    $arguments[$name] = (float) $value;
                     break;
                 case 'array':
-                    // Split by newlines
-                    $items = array_filter(array_map('trim', explode("\n", $value)));
-                    if (!empty($items)) {
-                        $arguments[$name] = $items;
+                    $items = array_filter(
+                        array_map('trim', explode("\n", (string) $value)),
+                        static fn ($v): bool => $v !== ''
+                    );
+                    // Cast to the declared item type so IDs arrive as ints.
+                    $itemType = $prop['items']['type'] ?? 'string';
+                    if ($itemType === 'integer') {
+                        $items = array_map('intval', $items);
+                    } elseif ($itemType === 'number') {
+                        $items = array_map('floatval', $items);
+                    }
+                    if ($items !== []) {
+                        $arguments[$name] = array_values($items);
                     }
                     break;
                 default:
-                    $arguments[$name] = (string)$value;
+                    $arguments[$name] = (string) $value;
             }
         }
 
         return $arguments;
     }
 
-    private function executeAndRender(ToolRegistry $registry, string $tool, array $arguments): void
+    private function executeAndRender(string $tool, array $arguments): void
     {
         echo '<div class="result">';
         echo '<h2>Result</h2>';
 
         echo '<div class="request">';
         echo '<h3>Request</h3>';
-        echo '<pre>' . htmlspecialchars(json_encode([
-            'tool' => $tool,
-            'arguments' => $arguments,
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) . '</pre>';
+        echo '<pre>' . htmlspecialchars(json_encode(
+            ['tool' => $tool, 'arguments' => $arguments],
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+        )) . '</pre>';
         echo '</div>';
 
         echo '<div class="response">';
         echo '<h3>Response</h3>';
-        $result = $registry->call($tool, $arguments);
         try {
-            $result = $registry->call($tool, $arguments);
-            echo '<pre class="success">' . htmlspecialchars(json_encode(
-                $result['structuredContent'],
-                JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
-            )) . '</pre>';
+            $result  = $this->callTool($tool, $arguments);
+            // A tool-level error is a normal payload with an 'error' key, not
+            // an exception — style it red rather than pretending it succeeded.
+            $isError = isset($result['error']);
+            echo '<pre class="' . ($isError ? 'error' : 'success') . '">'
+                . htmlspecialchars(json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES))
+                . '</pre>';
         } catch (JsonRpcException $e) {
             echo '<pre class="error">' . htmlspecialchars(json_encode([
                 'error' => [
-                    'code' => $e->getCode(),
+                    'code'    => $e->getCode(),
                     'message' => $e->getMessage(),
-                    'data' => $e->getData(),
+                    'data'    => $e->getData(),
                 ],
             ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) . '</pre>';
         } catch (\Throwable $e) {
             echo '<pre class="error">' . htmlspecialchars(json_encode([
-                'error' => [
-                    'code' => -32603,
-                    'message' => $e->getMessage(),
-                ],
+                'error' => ['code' => -32603, 'message' => $e->getMessage()],
             ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) . '</pre>';
         }
+        echo '</div>';
+        echo '</div>';
+    }
 
-        echo '</div>';
-        echo '</div>';
+    // -------------------------------------------------- CLI
+
+    protected function runCliMode(array $definitions): void
+    {
+        echo "\n" . str_repeat('=', 60) . "\n";
+        echo "MCP Catalogue Tools Test (CLI Mode)\n";
+        echo str_repeat('=', 60) . "\n\n";
+
+        echo "Available tools:\n";
+        foreach ($definitions as $def) {
+            echo sprintf("  - %s: %s\n", $def['name'], $def['title'] ?? $def['description']);
+        }
+
+        echo "\nRunning basic tests...\n\n";
+
+        foreach ($this->smokeTests() as $test) {
+            echo sprintf("--- %s ---\n", $test['label']);
+            try {
+                $result = $this->callTool($test['tool'], $test['args']);
+                if (isset($result['error'])) {
+                    $message = is_string($result['error']) ? $result['error'] : json_encode($result['error']);
+                    echo '[ERROR] ' . $message . "\n\n";
+                    continue;
+                }
+                if (isset($test['summary'])) {
+                    echo $test['summary']($result) . "\n";
+                }
+                echo "[OK]\n\n";
+            } catch (\Throwable $e) {
+                echo '[ERROR] ' . $e->getMessage() . "\n\n";
+            }
+        }
+
+        $segment = Config::inst()->get(static::class, 'segment');
+        echo "For interactive testing, use the browser interface at /dev/tasks/{$segment}\n";
     }
 
     private function renderStyles(): string
@@ -325,46 +433,5 @@ button[type="submit"]:hover { background: #0056b3; }
 .tool-info strong { color: #007bff; }
 </style>
 HTML;
-    }
-
-    /**
-     * CLI fallback - runs automated tests
-     */
-    private function runCliMode(ToolRegistry $registry, array $definitions): void
-    {
-        echo "\n" . str_repeat('=', 60) . "\n";
-        echo "MCP Catalogue Tools Test (CLI Mode)\n";
-        echo str_repeat('=', 60) . "\n\n";
-
-        echo "Available tools:\n";
-        foreach ($definitions as $def) {
-            echo sprintf("  - %s: %s\n", $def['name'], $def['title'] ?? $def['description']);
-        }
-
-        echo "\nRunning basic tests...\n\n";
-
-        // Test list_categories
-        echo "--- list_categories ---\n";
-        try {
-            $result = $registry->call('list_categories', []);
-            $categories = $result['structuredContent']['categories'] ?? [];
-            echo sprintf("Found %d categories\n", count($categories));
-            echo "[OK]\n";
-        } catch (\Throwable $e) {
-            echo "[ERROR] " . $e->getMessage() . "\n";
-        }
-
-        // Test search_products
-        echo "\n--- search_products (query: 'test') ---\n";
-        try {
-            $result = $registry->call('search_products', ['query' => 'test', 'limit' => 3]);
-            $data = $result['structuredContent'];
-            echo sprintf("Returned: %d, Total: %d\n", $data['returned'], $data['total_matched']);
-            echo "[OK]\n";
-        } catch (\Throwable $e) {
-            echo "[ERROR] " . $e->getMessage() . "\n";
-        }
-
-        echo "\nFor interactive testing, use the browser interface at /dev/tasks/mcp-test\n";
     }
 }

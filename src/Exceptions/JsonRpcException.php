@@ -17,8 +17,9 @@ class JsonRpcException extends RuntimeException
         string $message,
         private readonly int $httpStatus = 400,
         private readonly ?array $data = null,
+        ?\Throwable $previous = null,
     ) {
-        parent::__construct($message, $code);
+        parent::__construct($message, $code, $previous);
     }
 
     public function getHttpStatus(): int
