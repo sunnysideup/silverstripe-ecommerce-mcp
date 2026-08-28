@@ -15,7 +15,7 @@ use Sunnysideup\EcommerceMCP\Tools\CatalogueTools;
  * routes tools/call to the right handler.
  *
  * Providers are registered by config, not auto-discovered: several providers
- * (e.g. CatalogueTools and its CatalogueToolsPW subclass) share tool names, so
+ * (e.g. CatalogueTools) share tool names, so
  * scanning every ToolProvider implementor would register duplicates in a
  * non-deterministic order. Explicit registration keeps the surface predictable.
  *
@@ -32,7 +32,7 @@ use Sunnysideup\EcommerceMCP\Tools\CatalogueTools;
  *
  *   SilverStripe\Core\Injector\Injector:
  *     Sunnysideup\EcommerceMCP\Tools\CatalogueTools:
- *       class: Sunnysideup\EcommerceMCP\Tools\CatalogueToolsPW
+ *       class: Sunnysideup\EcommerceMCP\Tools\CatalogueToolsFooBar
  */
 class ToolRegistry
 {

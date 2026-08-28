@@ -11,16 +11,6 @@ use SilverStripe\Dev\BuildTask;
 use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
 use Sunnysideup\EcommerceMCP\Registry\ToolRegistry;
 
-/**
- * Interactive test form for shop owners to test MCP catalogue tools.
- *
- * Run via browser:  /dev/tasks/mcp-test
- * Run via CLI:      sake dev/tasks/mcp-test   (runs smoke tests)
- *
- * Extension seams: definitions(), callTool() and smokeTests() are the three
- * points a subclass overrides to drive a specific ToolProvider instead of the
- * globally-registered ToolRegistry — see McpTestTaskPW.
- */
 class McpTestTask extends BuildTask
 {
     private static $segment = 'mcp-test';
