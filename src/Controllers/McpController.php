@@ -27,9 +27,13 @@ use Throwable;
  * Two verbs are served at this one endpoint:
  *   - POST: the JSON-RPC transport (tools/list, tools/call, server/discover).
  *   - GET:  a public, cacheable discovery manifest that registries and crawlers
- *           can read cold, without the protocol-version/header handshake a POST
- *           requires. (This revision removed the GET SSE stream, so GET is free
- *           to carry the manifest.)
+ *           can read cold. (This revision removed the GET SSE stream, so GET is
+ *           free to carry the manifest.)
+ *
+ * Abuse protection (rate limiting, IP reputation, WAF) is handled at the edge
+ * — Cloudflare in front, with the origin locked to Cloudflare's ranges. This
+ * controller keeps only what belongs in the app: a short-lived result cache so
+ * repeated identical catalogue queries don't re-hit the database.
  *
  * Spec: https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
  */
@@ -41,13 +45,12 @@ class McpController extends Controller
     private const META_NS = 'io.modelcontextprotocol/';
 
     /** JSON-RPC error codes. */
-    private const E_PARSE           = -32700;
-    private const E_INVALID_REQUEST = -32600;
+    private const E_PARSE            = -32700;
+    private const E_INVALID_REQUEST  = -32600;
     private const E_METHOD_NOT_FOUND = -32601;
-    private const E_INVALID_PARAMS  = -32602;
-    private const E_INTERNAL        = -32603;
-    private const E_HEADER_MISMATCH = -32020;
-    private const E_RATE_LIMITED    = -32029;
+    private const E_INVALID_PARAMS   = -32602;
+    private const E_INTERNAL         = -32603;
+    private const E_VERSION_MISMATCH = -32020;
 
     private static array $allowed_actions = ['index'];
 
@@ -56,13 +59,12 @@ class McpController extends Controller
     private static int $tools_list_ttl_ms = 3600000;
 
     /**
-     * Per-IP request cap per window. 0 (or less) disables rate limiting.
-     * These are deliberately coarse; a CDN/web-server limit in front is still
-     * the first line of defence for a publicly-listed endpoint.
+     * How long (seconds) a tools/call result is cached, keyed on tool name and
+     * arguments. 0 (or less) disables caching. This is also the freshness bound:
+     * an edit won't show to agents until the cached entry expires. Keep it short
+     * enough that stale prices/stock are acceptable, or flush on publish.
      */
-    private static int $rate_limit_max = 60;
-
-    private static int $rate_limit_window_seconds = 60;
+    private static int $result_cache_ttl_seconds = 300;
 
     public function index(HTTPRequest $request): HTTPResponse
     {
@@ -76,11 +78,6 @@ class McpController extends Controller
         // removed in this revision. Older clients may still try them.
         if (!$request->isPOST()) {
             return $this->plain(405, 'Method Not Allowed');
-        }
-
-        // Throttle before touching origin checks, JSON parsing or the DB.
-        if (($retryAfter = $this->rateLimitRetryAfter($request)) !== null) {
-            return $this->tooManyRequests($retryAfter);
         }
 
         if (($origin = $request->getHeader('Origin')) && !$this->originAllowed($origin)) {
@@ -109,7 +106,6 @@ class McpController extends Controller
 
         try {
             $this->assertProtocolVersion($request, $params);
-            $this->assertHeadersMatchBody($request, $method, $params);
 
             $result = $this->dispatch($method, is_array($params) ? $params : []);
         } catch (JsonRpcException $e) {
@@ -150,65 +146,6 @@ class McpController extends Controller
         return $response;
     }
 
-    // ------------------------------------------------------------ rate limiting
-
-    /**
-     * Fixed-window per-IP limiter. Returns the number of seconds until the
-     * window resets when the cap is exceeded, or null when the request is
-     * allowed (or limiting is disabled / the IP is unknown).
-     *
-     * The get-then-set is not atomic, so under heavy concurrency the effective
-     * cap can drift slightly above the configured value. That is fine for a
-     * coarse abuse guard; if you need a hard cap, enforce it at the CDN/LB.
-     */
-    private function rateLimitRetryAfter(HTTPRequest $request): ?int
-    {
-        $max = (int) static::config()->get('rate_limit_max');
-        if ($max <= 0) {
-            return null; // disabled
-        }
-
-        $ip = (string) $request->getIP();
-        if ($ip === '') {
-            return null; // can't identify the caller — don't block everyone
-        }
-
-        $window = max(1, (int) static::config()->get('rate_limit_window_seconds'));
-        $bucket = (int) floor(time() / $window);
-        $key    = 'mcp_rl_' . sha1($ip) . '_' . $bucket;
-
-        $cache = $this->rateLimitCache();
-        $count = (int) $cache->get($key, 0);
-
-        if ($count >= $max) {
-            $resetsIn = (($bucket + 1) * $window) - time();
-
-            return $resetsIn > 0 ? $resetsIn : 1;
-        }
-
-        // TTL just past the window so the bucket key self-expires.
-        $cache->set($key, $count + 1, $window + 1);
-
-        return null;
-    }
-
-    private function rateLimitCache(): CacheInterface
-    {
-        return Injector::inst()->get(CacheInterface::class . '.mcpRateLimiter');
-    }
-
-    private function tooManyRequests(int $retryAfter): HTTPResponse
-    {
-        $response = $this->json(429, [
-            'jsonrpc' => '2.0',
-            'id'      => null,
-            'error'   => ['code' => self::E_RATE_LIMITED, 'message' => 'Rate limit exceeded'],
-        ]);
-        $response->addHeader('Retry-After', (string) $retryAfter);
-
-        return $response;
-    }
-
     // ---------------------------------------------------------------- routing
 
     private function dispatch(string $method, array $params): array
@@ -236,15 +173,23 @@ class McpController extends Controller
             ),
         };
     }
+
     /**
-     * Execute a tool and record the call. The log write is wrapped so a DB
-     * failure degrades to a warning rather than turning a good tool response
-     * into a 500 — an audit trail must never be load-bearing for the response.
+     * Execute a tool (via the result cache) and record the call. Logging runs
+     * on every request — cache hit or miss — because the agent asked either way;
+     * only the DB-hitting execution is short-circuited by the cache.
+     *
+     * The log write is wrapped so a DB failure degrades to a warning rather than
+     * turning a good tool response into a 500 — an audit trail must never be
+     * load-bearing for the response.
      */
     private function callTool(ToolRegistry $registry, string $name, array $arguments): array
     {
+        // Force the live stage before anything reads products, so drafts can
+        // never leak to an agent — and so nothing draft-shaped enters the cache.
         Versioned::set_stage(Versioned::LIVE);
-        $result = $registry->call($name, $arguments);
+
+        $result = $this->executeCached($registry, $name, $arguments);
 
         try {
             McpRequestLog::track(
@@ -259,10 +204,82 @@ class McpController extends Controller
         return $result;
     }
 
+    // ------------------------------------------------------------ result cache
+
+    /**
+     * Return a cached result for this (name, arguments) pair, or execute and
+     * cache it. Cache read/write failures never break the call — a broken cache
+     * degrades to "always execute", not to an error.
+     */
+    public function executeCached(ToolRegistry $registry, string $name, array $arguments): array
+    {
+        $ttl = (int) static::config()->get('result_cache_ttl_seconds');
+        if ($ttl <= 0) {
+            return $registry->call($name, $arguments); // caching disabled
+        }
+
+        $cache = $this->resultCache();
+        $key   = $this->cacheKey($name, $arguments);
+
+        try {
+            $cached = $cache->get($key);
+            if (is_array($cached)) {
+                return $cached;
+            }
+        } catch (Throwable $e) {
+            // fall through to execution on any read failure
+        }
+
+        $result = $registry->call($name, $arguments);
+
+        // Only cache clean results. A transient in-band error (unknown SKU,
+        // etc.) shouldn't stick around for the whole TTL.
+        if (empty($result['isError'])) {
+            try {
+                $cache->set($key, $result, $ttl);
+            } catch (Throwable $e) {
+                // a failed cache write is not a failed request
+            }
+        }
+
+        return $result;
+    }
+
+    private function resultCache(): CacheInterface
+    {
+        return Injector::inst()->get(CacheInterface::class . '.mcpResultCache');
+    }
+
+    /**
+     * A deterministic cache key for a tool call. Argument key order is
+     * normalised so {query, limit} and {limit, query} hit the same entry; the
+     * *value* order of list arguments (e.g. category_ids) is left alone, so
+     * [1,2] and [2,1] are distinct entries — a minor cache miss, never a
+     * correctness issue.
+     */
+    private function cacheKey(string $name, array $arguments): string
+    {
+        $canonical = $this->canonicaliseKeys($arguments);
+
+        return 'mcp_call_' . sha1($name . '|' . json_encode($canonical, JSON_UNESCAPED_SLASHES));
+    }
+
+    private function canonicaliseKeys(array $data): array
+    {
+        ksort($data);
+        foreach ($data as $k => $v) {
+            if (is_array($v)) {
+                $data[$k] = $this->canonicaliseKeys($v);
+            }
+        }
+
+        return $data;
+    }
+
     /**
      * Best-effort "number of results provided" across the tool surface: a
-     * results/categories list is counted; an error payload is zero; a single
-     * object (e.g. get_product) is one.
+     * results/categories/brands list is counted; an error payload is zero; a
+     * single object (e.g. get_product) is one.
      */
     private function countResults(mixed $result): int
     {
@@ -281,6 +298,7 @@ class McpController extends Controller
         }
         return isset($payload['error']) ? 0 : 1;
     }
+
     /**
      * Capability discovery. Replaces the initialize/initialized handshake,
      * which no longer exists. Clients call this on demand rather than up front.
@@ -311,25 +329,21 @@ class McpController extends Controller
 
     // ------------------------------------------------------------- validation
 
+    /**
+     * The transport spec expects an MCP-Protocol-Version header, but a terse
+     * client that omits it isn't ambiguous when we speak exactly one version —
+     * so a missing header defaults rather than being rejected. What we still
+     * reject: a version we don't speak, or a header that contradicts _meta
+     * (which would mean a confused or tampering intermediary).
+     */
     private function assertProtocolVersion(HTTPRequest $request, mixed $params): void
     {
-        $header = $request->getHeader('MCP-Protocol-Version');
+        $header = $request->getHeader('MCP-Protocol-Version') ?? self::SUPPORTED_VERSIONS[0];
         $meta   = is_array($params) ? ($params['_meta'][self::META_NS . 'protocolVersion'] ?? null) : null;
 
-        if ($header === null) {
-            throw new JsonRpcException(
-                self::E_HEADER_MISMATCH,
-                'Missing required MCP-Protocol-Version header',
-                400,
-            );
-        }
-
-        // The header must agree with the body. Divergence is a security
-        // problem when a gateway routes on the header but the server
-        // executes on the body.
         if ($meta !== null && $meta !== $header) {
             throw new JsonRpcException(
-                self::E_HEADER_MISMATCH,
+                self::E_VERSION_MISMATCH,
                 'MCP-Protocol-Version header does not match _meta',
                 400,
             );
@@ -343,59 +357,6 @@ class McpController extends Controller
                 ['supported' => self::SUPPORTED_VERSIONS],
             );
         }
-    }
-
-    /**
-     * Mcp-Method is required on every request; Mcp-Name on tools/call,
-     * resources/read and prompts/get. Both must match the body.
-     */
-    private function assertHeadersMatchBody(HTTPRequest $request, string $method, mixed $params): void
-    {
-        $headerMethod = $request->getHeader('Mcp-Method');
-        if ($headerMethod === null) {
-            throw new JsonRpcException(self::E_HEADER_MISMATCH, 'Missing Mcp-Method header', 400);
-        }
-        if ($headerMethod !== $method) {
-            throw new JsonRpcException(
-                self::E_HEADER_MISMATCH,
-                sprintf('Mcp-Method header "%s" does not match body method "%s"', $headerMethod, $method),
-                400,
-            );
-        }
-
-        if ($method !== 'tools/call') {
-            return;
-        }
-
-        $headerName = $request->getHeader('Mcp-Name');
-        if ($headerName === null) {
-            throw new JsonRpcException(self::E_HEADER_MISMATCH, 'Missing Mcp-Name header', 400);
-        }
-
-        $bodyName = is_array($params) ? ($params['name'] ?? null) : null;
-        if ($this->decodeHeaderValue($headerName) !== $bodyName) {
-            throw new JsonRpcException(
-                self::E_HEADER_MISMATCH,
-                'Mcp-Name header does not match body params.name',
-                400,
-            );
-        }
-    }
-
-    /**
-     * Header values that cannot be represented as plain ASCII arrive wrapped
-     * in the sentinel format =?base64?...?=
-     */
-    private function decodeHeaderValue(string $value): string
-    {
-        if (!str_starts_with($value, '=?base64?') || !str_ends_with($value, '?=')) {
-            return $value;
-        }
-
-        $payload = substr($value, 9, -2);
-        $decoded = base64_decode($payload, true);
-
-        return $decoded === false ? $value : $decoded;
     }
 
     private function originAllowed(string $origin): bool
