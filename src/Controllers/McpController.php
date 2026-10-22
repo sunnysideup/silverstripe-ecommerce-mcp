@@ -189,9 +189,15 @@ class McpController extends Controller implements Flushable
             'capabilities'    => [
                 'tools' => new \stdClass(),
             ],
-            'instructions' => 'Search this catalogue with search_products before '
-                . 'answering questions about availability or price. Always cite the '
-                . 'returned url when recommending a product.',
+            'instructions' => 'Search this catalogue with `search_products` before '
+                . 'answering questions about availability, features, or price. Always cite the '
+                . 'exact returned `url` when recommending a product.'
+                . "\n\nEXAMPLE WORKFLOW:\n"
+                . "User: \"Do you have any red shoes under $1000?\"\n"
+                . "1. Call `search_products` with parameters (e.g., query: \"red shoes\", max_price: 1000).\n"
+                . "2. Review the returned catalogue items.\n"
+                . "3. Answer the user by summarizing the best match, stating the price, "
+                . "and providing the direct link using the `url` field from the tool's response.",
         ];
     }
     /**
@@ -325,23 +331,7 @@ class McpController extends Controller implements Flushable
      */
     private function discover(): array
     {
-        return [
-            'protocolVersion' => self::DEFAULT_VERSION,
-            'serverInfo'      => [
-                'name'    => 'catalogue',
-                'title'   => 'Product Catalogue',
-                'version' => '1.0.0',
-            ],
-            'capabilities'    => [
-                // No listChanged: the catalogue tool surface is fixed, and
-                // clients honour ttlMs instead.
-                'tools' => new \stdClass(),
-            ],
-            'instructions' => implode(' ', [
-                'Search this catalogue with search_products before answering',
-                'questions about availability or price.',
-                'Always cite the returned url when recommending a product.',
-            ]),
+        return $this->initialize([]) + [
             'ttlMs'      => static::config()->get('tools_list_ttl_ms'),
             'cacheScope' => 'public',
         ];
