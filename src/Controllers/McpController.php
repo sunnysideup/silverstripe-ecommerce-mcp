@@ -72,7 +72,7 @@ class McpController extends Controller implements Flushable
         // GET → public discovery manifest. Registries read this to learn the
         // endpoint and capabilities before ever issuing a JSON-RPC POST.
         if ($request->isGET()) {
-            return $this->manifest($request);
+            return $this->manifest();
         }
 
         // The GET stream endpoint and the DELETE session teardown were both
@@ -106,7 +106,7 @@ class McpController extends Controller implements Flushable
         }
 
         try {
-            $result = $this->dispatch($method, is_array($params) ? $params : []);
+            [$result, $cacheable] = $this->dispatch($method, is_array($params) ? $params : []);
         } catch (JsonRpcException $e) {
             return $this->error($id, $e->getCode(), $e->getMessage(), $e->getHttpStatus(), $e->getData());
         } catch (Throwable $e) {
@@ -119,7 +119,7 @@ class McpController extends Controller implements Flushable
             'jsonrpc' => '2.0',
             'id'      => $id,
             'result'  => $result,
-        ]);
+        ], $cacheable);
     }
 
     // ---------------------------------------------------------------- discovery
@@ -130,16 +130,15 @@ class McpController extends Controller implements Flushable
      * reader needs (where to POST, which verbs and protocol versions). Marked
      * cacheable so CDNs and crawlers don't re-fetch it on every visit.
      */
-    private function manifest(HTTPRequest $request): HTTPResponse
+    public function manifest(): HTTPResponse
     {
         $payload = $this->discover() + [
-            'endpoint'                  => Director::absoluteURL($request->getURL()),
+            'endpoint'                  => Director::absoluteURL('mcp'),
             'transport'                 => 'streamable-http',
             'methods'                   => ['POST'],
         ];
 
-        $response = $this->json(200, $payload);
-        $response->addHeader('Cache-Control', 'public, max-age=3600');
+        $response = $this->json(200, $payload, true);
 
         return $response;
     }
@@ -151,20 +150,20 @@ class McpController extends Controller implements Flushable
         $registry = Injector::inst()->get(ToolRegistry::class);
 
         return match ($method) {
-            'initialize' => $this->initialize($params),
-            'server/discover' => $this->discover(),
-            'tools/list'      => [
+            'initialize' => [$this->initialize($params), true],
+            'server/discover' => [$this->discover(), true],
+            'tools/list'      => [[
                 'tools'      => $registry->definitions(),
                 // Advertised so clients and gateways can cache the tool
                 // surface instead of re-fetching it before every call.
                 'ttlMs'      => static::config()->get('tools_list_ttl_ms'),
                 'cacheScope' => 'public',
-            ],
-            'tools/call' => $this->callTool(
+            ], true],
+            'tools/call' => [$this->callTool(
                 $registry,
                 (string) ($params['name'] ?? ''),
                 (array) ($params['arguments'] ?? []),
-            ),
+            ), false],
             default => throw new JsonRpcException(
                 self::E_METHOD_NOT_FOUND,
                 sprintf('Unknown method "%s"', $method),
@@ -378,14 +377,16 @@ class McpController extends Controller implements Flushable
 
     // ---------------------------------------------------------------- output
 
-    private function json(int $status, array $payload): HTTPResponse
+    private function json(int $status, array $payload, bool $cacheable = false): HTTPResponse
     {
         $response = HTTPResponse::create(
             json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
             $status,
         );
+        if ($cacheable) {
+            $response->addHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+        }
         $response->addHeader('Content-Type', 'application/json');
-        $response->addHeader('Mcp-Session-Id', bin2hex(random_bytes(16)));
         return $response;
     }
 
