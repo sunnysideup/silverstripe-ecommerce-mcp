@@ -6,5 +6,9 @@ SilverStripe\Core\Injector\Injector:
     factory: SilverStripe\Core\Cache\CacheFactory
     constructor:
       namespace: 'mcpResultCache'
+  Psr\SimpleCache\CacheInterface.mcpThrottle:
+    factory: SilverStripe\Core\Cache\CacheFactory
+    constructor:
+      namespace: 'mcpThrottle'
 Sunnysideup\EcommerceMCP\Controllers\McpController:
   result_cache_ttl_seconds: 300

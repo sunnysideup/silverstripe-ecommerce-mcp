@@ -64,6 +64,14 @@ class ToolRegistry
     }
 
     /**
+     * True if at least one enabled provider offers at least one tool.
+     */
+    public function hasTools(): bool
+    {
+        return count($this->buildIndex()) > 0;
+    }
+
+    /**
      * Execute a tool and wrap its return value in a CallToolResult.
      */
     public function call(string $name, array $arguments): array

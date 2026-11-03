@@ -10,6 +10,7 @@ use SilverStripe\ORM\DB;
 use SilverStripe\ORM\FieldType\DBDatetime;
 use SilverStripe\Security\Permission;
 use SilverStripe\Security\PermissionProvider;
+use Sunnysideup\Ecommerce\Model\Address\EcommerceCountry;
 
 /**
  * An append-only audit trail of MCP tool calls.
@@ -90,7 +91,7 @@ class McpRequestLog extends DataObject implements PermissionProvider
         string $toolName = '',
     ): self {
         $log = self::create();
-        $log->Query       = $query;
+        $log->Query       = mb_substr($query, 0, 1000);
         $log->ResultCount = $resultCount;
         $log->ToolName    = $toolName;
 
@@ -98,8 +99,10 @@ class McpRequestLog extends DataObject implements PermissionProvider
 
         if (Controller::has_curr()) {
             $request = Controller::curr()->getRequest();
-            $log->IPAddress  = (string) $request->getIP();
-            $log->ClientName = (string) ($request->getHeader('User-Agent') ?: 'Anonymous');
+            // plain getIP() would be CloudFlare's address
+            $ip = class_exists(EcommerceCountry::class) ? EcommerceCountry::get_ip() : (string) $request->getIP();
+            $log->IPAddress  = mb_substr($ip, 0, 45);
+            $log->ClientName = mb_substr((string) ($request->getHeader('User-Agent') ?: 'Anonymous'), 0, 255);
         }
 
         $log->write();

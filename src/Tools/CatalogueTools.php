@@ -41,9 +41,26 @@ class CatalogueTools implements ToolProvider
 
     private static bool $is_enabled = true;
 
+    /**
+     * Alias of is_enabled: some config sets `enabled: false`. Either flag
+     * being false disables the module.
+     */
+    private static ?bool $enabled = null;
+
+    /**
+     * Maximum number of ids accepted in category_ids / brand_ids.
+     */
+    private static int $max_id_list_size = 10;
+
+    private static int $max_query_length = 200;
+
     public function isEnabled(): bool
     {
-        return $this->config()->get('is_enabled');
+        if (! $this->config()->get('is_enabled')) {
+            return false;
+        }
+
+        return false !== $this->config()->get('enabled');
     }
 
     private static int $max_results = 20;
@@ -132,6 +149,7 @@ class CatalogueTools implements ToolProvider
 
     public function execute(string $name, array $arguments): mixed
     {
+        $arguments = $this->boundArguments($arguments);
         $this->searchArgs = $arguments;
         return match ($name) {
             'search_products' => $this->searchProducts(),
@@ -139,6 +157,29 @@ class CatalogueTools implements ToolProvider
             'list_categories' => $this->listCategories(),
             default => throw new JsonRpcException(-32602, sprintf('Unknown tool "%s"', $name), 400),
         };
+    }
+
+    /**
+     * Cap the size of the id lists and the query length so a caller can not make
+     * one request run an unbounded number of queries.
+     */
+    protected function boundArguments(array $arguments): array
+    {
+        $max = max(1, (int) $this->config()->get('max_id_list_size'));
+        foreach (['category_ids', 'brand_ids'] as $key) {
+            if (isset($arguments[$key])) {
+                $ids = is_array($arguments[$key]) ? $arguments[$key] : [$arguments[$key]];
+                $ids = array_filter($ids, 'is_scalar');
+                $arguments[$key] = array_slice(array_values(array_unique(array_map('intval', $ids))), 0, $max);
+            }
+        }
+        if (isset($arguments['query'])) {
+            $arguments['query'] = is_scalar($arguments['query'])
+                ? mb_substr((string) $arguments['query'], 0, max(1, (int) $this->config()->get('max_query_length')))
+                : '';
+        }
+
+        return $arguments;
     }
 
     // ------------------------------------------------------------------ tools
@@ -339,7 +380,18 @@ class CatalogueTools implements ToolProvider
             return null;
         }
 
-        return Product::get()->filter('InternalItemID', Convert::raw2sql($sku))->first();
+        // same visibility rules as search: product_filter (ShowInSearch / AllowPurchase)
+        $product = Product::get()
+            ->filter($this->getProductFilter())
+            ->filter('InternalItemID', $sku)
+            ->first();
+
+        // the stage is forced to LIVE by the controller; make sure the product is also viewable.
+        if ($product && ! $product->canView()) {
+            return null;
+        }
+
+        return $product;
     }
 
     protected function products(): DataList
@@ -378,6 +430,7 @@ class CatalogueTools implements ToolProvider
     {
         $categoryIds = (array) ($this->searchArgs['category_ids'] ?? []);
         $categoryIds = array_values(array_unique(array_map('intval', $categoryIds)));
+        $categoryIds = array_slice($categoryIds, 0, max(1, (int) $this->config()->get('max_id_list_size')));
         if (empty($categoryIds)) {
             return $list;
         }

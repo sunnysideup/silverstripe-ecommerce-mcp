@@ -12,6 +12,7 @@ use SilverStripe\Control\HTTPResponse;
 use SilverStripe\Core\Flushable;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\Versioned\Versioned;
+use Sunnysideup\Ecommerce\Model\Address\EcommerceCountry;
 use Sunnysideup\EcommerceMCP\Exceptions\JsonRpcException;
 use Sunnysideup\EcommerceMCP\Model\McpRequestLog;
 use Sunnysideup\EcommerceMCP\Registry\ToolRegistry;
@@ -66,8 +67,30 @@ class McpController extends Controller implements Flushable
      */
     private static int $result_cache_ttl_seconds = 300;
 
+    /**
+     * Maximum number of POST requests per client IP in the rate limit window.
+     * 0 (or less) disables the limit.
+     */
+    private static int $rate_limit_requests = 120;
+
+    private static int $rate_limit_window_seconds = 600;
+
+    /**
+     * Maximum size of a request body in bytes.
+     */
+    private static int $max_body_bytes = 65536;
+
+    /**
+     * Maximum number of ids accepted in category_ids / brand_ids.
+     */
+    private static int $max_id_list_size = 10;
+
     public function index(HTTPRequest $request): HTTPResponse
     {
+        // the module can be switched off (is_enabled / enabled config)
+        if ($this->isDisabled()) {
+            return $this->plain(404, 'Not Found');
+        }
 
         // GET → public discovery manifest. Registries read this to learn the
         // endpoint and capabilities before ever issuing a JSON-RPC POST.
@@ -85,7 +108,20 @@ class McpController extends Controller implements Flushable
             return $this->plain(403, 'Forbidden');
         }
 
-        $body = json_decode((string) $request->getBody(), true);
+        $rawBody = (string) $request->getBody();
+        $maxBytes = (int) static::config()->get('max_body_bytes');
+        if ($maxBytes > 0 && (strlen($rawBody) > $maxBytes || (int) $request->getHeader('Content-Length') > $maxBytes)) {
+            return $this->error(null, self::E_INVALID_REQUEST, 'Request body too large', 413);
+        }
+
+        if ($this->isRateLimited()) {
+            $response = $this->error(null, self::E_INVALID_REQUEST, 'Too many requests', 429);
+            $response->addHeader('Retry-After', (string) max(1, (int) static::config()->get('rate_limit_window_seconds')));
+
+            return $response;
+        }
+
+        $body = json_decode($rawBody, true);
         if (!is_array($body)) {
             return $this->error(null, self::E_PARSE, 'Malformed JSON body', 400);
         }
@@ -132,6 +168,9 @@ class McpController extends Controller implements Flushable
      */
     public function manifest(): HTTPResponse
     {
+        if ($this->isDisabled()) {
+            return $this->plain(404, 'Not Found');
+        }
         $payload = $this->discover() + [
             'endpoint'                  => Director::absoluteURL('mcp'),
             'transport'                 => 'streamable-http',
@@ -214,6 +253,16 @@ class McpController extends Controller implements Flushable
         // never leak to an agent — and so nothing draft-shaped enters the cache.
         Versioned::set_stage(Versioned::LIVE);
 
+        // bound the id lists before they reach the cache key or the database
+        $maxIds = max(1, (int) static::config()->get('max_id_list_size'));
+        foreach (['category_ids', 'brand_ids'] as $key) {
+            if (isset($arguments[$key])) {
+                $ids = is_array($arguments[$key]) ? $arguments[$key] : [$arguments[$key]];
+                $ids = array_filter($ids, 'is_scalar');
+                $arguments[$key] = array_slice(array_values(array_unique(array_map('intval', $ids))), 0, $maxIds);
+            }
+        }
+
         $result = $this->executeCached($registry, $name, $arguments);
 
         try {
@@ -273,6 +322,55 @@ class McpController extends Controller implements Flushable
     private static function resultCache(): CacheInterface
     {
         return Injector::inst()->get(CacheInterface::class . '.mcpResultCache');
+    }
+
+    private static function throttleCache(): CacheInterface
+    {
+        return Injector::inst()->get(CacheInterface::class . '.mcpThrottle');
+    }
+
+    /**
+     * Disabled if no tool provider is enabled (see CatalogueTools::isEnabled()).
+     */
+    private function isDisabled(): bool
+    {
+        try {
+            return ! Injector::inst()->get(ToolRegistry::class)->hasTools();
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Simple fixed window per-IP limit. Fails open if the cache is broken.
+     */
+    private function isRateLimited(): bool
+    {
+        $max = (int) static::config()->get('rate_limit_requests');
+        if ($max <= 0) {
+            return false;
+        }
+        $window = max(1, (int) static::config()->get('rate_limit_window_seconds'));
+        $ip = class_exists(EcommerceCountry::class) ? EcommerceCountry::get_ip() : (string) $this->getRequest()->getIP();
+
+        try {
+            $cache = static::throttleCache();
+            $key = 'mcp_rl_' . md5($ip);
+            $now = time();
+            $entry = $cache->get($key);
+            if (! is_array($entry) || ($entry['start'] ?? 0) + $window <= $now) {
+                $entry = ['start' => $now, 'count' => 0];
+            }
+            if ($entry['count'] >= $max) {
+                return true;
+            }
+            ++$entry['count'];
+            $cache->set($key, $entry, max(1, $entry['start'] + $window - $now));
+        } catch (Throwable $e) {
+            return false;
+        }
+
+        return false;
     }
 
     /**
