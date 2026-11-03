@@ -202,7 +202,7 @@ class CatalogueTools implements ToolProvider
                 'hint'          => 'Provide at least one query parameter.',
             ];
         }
-        $query = Convert::raw2sql(trim((string) ($this->searchArgs['query'] ?? '')));
+        $query = trim((string) ($this->searchArgs['query'] ?? ''));
 
         if (strlen($query) < 2) {
             $query = '';
